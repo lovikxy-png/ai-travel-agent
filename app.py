@@ -2042,7 +2042,9 @@ def format_budget_amount(amount: float) -> str:
     """format_budget_amount：把预算金额格式化为适合页面展示的文本。"""
 
     # numeric_amount：兼容 int 和 float 的预算金额数值。
-    numeric_amount = float(amount)
+    amount_text = str(amount).strip()
+    amount_match = re.search(r"[0-9][0-9,]*(?:\.\d+)?", amount_text)
+    numeric_amount = float(amount_match.group(0).replace(",", "")) if amount_match else float(amount)
 
     if numeric_amount.is_integer():
         return f"{int(numeric_amount):,}"
@@ -5353,7 +5355,8 @@ def build_budget_items(section_text: str, max_items: int = 6) -> list[dict]:
             title, description = raw_item.split(":", 1)
 
         title = clean_markdown_text(title)[:18] or "预算项"
-        description = clean_markdown_text(description)
+        description = re.sub(r"[*`#]+", "", str(description).strip())
+        description = re.sub(r"^[\-*\s]+", "", description).strip()
         if not description or is_budget_noise_line(description):
             continue
 
