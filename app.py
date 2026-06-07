@@ -14510,6 +14510,7295 @@ def render_beta_notice() -> None:
 
 
 def main() -> None:
+    """main: Streamlit application entry point."""
+
+    setup_page()
+
+    # Result page and home page are mutually exclusive.
+    if st.session_state.pop("force_regenerate", False):
+        st.session_state.pop("last_result_data", None)
+
+    has_result = bool(st.session_state.get("last_result_data"))
+    if has_result:
+        render_result_data(st.session_state["last_result_data"])
+        render_beta_notice()
+        return
+
+    render_hero(TRAVEL_INPUT_NAMESPACE)
+
+    try:
+        submitted, user_input, generation_mode = render_input_box(TRAVEL_INPUT_NAMESPACE)
+    except Exception as error:
+        st.error("\u9875\u9762\u7ec4\u4ef6\u52a0\u8f7d\u5f02\u5e38\uff0c\u8bf7\u5237\u65b0\u540e\u91cd\u8bd5\u3002")
+        if is_debug_enabled():
+            with st.expander("\u5f00\u53d1\u8005\u8c03\u8bd5\u4fe1\u606f", expanded=False):
+                st.exception(error)
+        submitted = False
+        generation_mode = GENERATION_MODE_FAST
+        user_input = (
+            st.session_state.get(get_travel_textarea_key(TRAVEL_INPUT_NAMESPACE))
+            or st.session_state.get(TRAVEL_INPUT_STATE_KEY)
+            or ""
+        )
+    render_generation_quota()
+
+    if submitted:
+        generation_key = build_generation_cache_key(user_input, generation_mode)
+        if not user_input.strip():
+            st.warning("\u8bf7\u5148\u8f93\u5165\u4e00\u53e5\u65c5\u884c\u9700\u6c42\u3002")
+        elif get_generation_count() >= MAX_GENERATIONS_PER_SESSION:
+            st.warning(
+                f"\u5f53\u524d Beta \u6d4b\u8bd5\u7248\u6bcf\u4e2a\u6d4f\u89c8\u5668\u4f1a\u8bdd\u6700\u591a\u751f\u6210 {MAX_GENERATIONS_PER_SESSION} \u6b21\u653b\u7565\u3002"
+                "\u8bf7\u5237\u65b0\u6d4f\u89c8\u5668\u4f1a\u8bdd\u6216\u7a0d\u540e\u518d\u8bd5\u3002"
+            )
+        else:
+            st.session_state["generation_count"] = get_generation_count() + 1
+            result_data = build_result_data(user_input.strip(), generation_mode)
+            result_data["generation_key"] = generation_key
+            st.session_state["last_result_data"] = result_data
+            st.rerun()
+
+    st.markdown(
+        """
+        <p class="hint">\u793a\u4f8b\u8f93\u5165\uff1a\u6211\u60f3\u53bb\u4e1c\u4eac\u65c5\u6e38\uff0c\u559c\u6b22\u52a8\u6f2b\u3001\u7f8e\u98df\u548c\u591c\u666f\uff0c\u9884\u7b975000\uff0c\u60f3\u73a9 3 \u5929 2 \u665a\u3002</p>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    render_beta_notice()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        if is_debug_enabled():
+            st.exception(error)
+        else:
+            st.error("页面组件加载异常，请刷新后重试。")
+import html
+import hashlib
+import json
+import os
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+
+import requests
+import streamlit as st
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+try:
+    from tavily import TavilyClient
+except ImportError:
+    TavilyClient = None
+
+
+# DEFAULT_TRAVEL_DAYS：用户没有写旅行天数时，默认按 3 天处理。
+DEFAULT_TRAVEL_DAYS = 3
+
+# DEFAULT_TRAVEL_NIGHTS：用户没有写住宿晚数时，默认按 2 晚处理。
+DEFAULT_TRAVEL_NIGHTS = 2
+
+# DEFAULT_BUDGET_LEVEL：用户没有写预算时，默认使用普通预算。
+DEFAULT_BUDGET_LEVEL = "普通预算"
+
+# DEFAULT_BUDGET_CURRENCY：用户输入预算数字但没有写货币单位时，默认按人民币处理。
+DEFAULT_BUDGET_CURRENCY = "CNY"
+
+# DEFAULT_DESTINATION：用户没有写明确目的地时，用于演示的默认目的地。
+DEFAULT_DESTINATION = "东京"
+
+# DEEPSEEK_BASE_URL：DeepSeek API 的基础地址，OpenAI SDK 会通过这个地址请求 DeepSeek。
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+# DEFAULT_DEEPSEEK_MODEL：用户没有在 .env 配置模型时，默认使用的 DeepSeek 模型。
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+
+# DEFAULT_SEARCH_MAX_RESULTS：每个搜索查询最多保留的结果数量。
+DEFAULT_SEARCH_MAX_RESULTS = 3
+
+# DEFAULT_TAVILY_SEARCH_DEPTH：Tavily 默认使用 basic 搜索，控制搜索额度消耗。
+DEFAULT_TAVILY_SEARCH_DEPTH = "basic"
+
+# DEFAULT_TAVILY_MAX_SEARCHES_PER_GUIDE：每份攻略默认最多调用 Tavily 的次数。
+DEFAULT_TAVILY_MAX_SEARCHES_PER_GUIDE = 1
+
+# TAVILY_CACHE_FILE：Tavily 搜索结果本地缓存文件，避免 12 小时内重复消耗额度。
+TAVILY_CACHE_FILE = "tavily_cache.json"
+
+# TAVILY_CACHE_TTL_SECONDS：Tavily 缓存有效期，省额度模式下 12 小时内不重复搜索。
+TAVILY_CACHE_TTL_SECONDS = 12 * 60 * 60
+
+# TAVILY_CACHE_PATH：Tavily 缓存文件的绝对路径。
+TAVILY_CACHE_PATH = Path(__file__).with_name(TAVILY_CACHE_FILE)
+
+# MAX_GENERATIONS_PER_SESSION：Beta 测试版每个浏览器会话最多生成攻略次数，避免 API 被滥用。
+MAX_GENERATIONS_PER_SESSION = 3
+
+# OPEN_METEO_GEOCODING_URL：Open-Meteo 免费地理编码接口，不需要 API Key。
+OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+
+# OPEN_METEO_FORECAST_URL：Open-Meteo 免费天气预报接口，不需要 API Key。
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+# WEATHER_FORECAST_DAYS：天气模块默认展示最近几天。
+WEATHER_FORECAST_DAYS = 3
+
+# WEATHER_GEOCODE_CACHE_TTL_SECONDS：Open-Meteo 地理编码缓存有效期。
+WEATHER_GEOCODE_CACHE_TTL_SECONDS = 24 * 60 * 60
+
+# WEATHER_FORECAST_CACHE_TTL_SECONDS：Open-Meteo 天气结果缓存有效期。
+WEATHER_FORECAST_CACHE_TTL_SECONDS = 60 * 60
+
+# GENERATION_MODE_FAST：快速版模式标识。
+GENERATION_MODE_FAST = "fast"
+
+# GENERATION_MODE_DEEP：深度版模式标识。
+GENERATION_MODE_DEEP = "deep"
+
+# GENERATION_MODE_OPTIONS：页面生成模式选项。
+GENERATION_MODE_OPTIONS = {
+    "快速版": GENERATION_MODE_FAST,
+    "深度版": GENERATION_MODE_DEEP,
+}
+
+# GENERATION_MODE_LABELS：模式标识到页面文案的映射。
+GENERATION_MODE_LABELS = {
+    GENERATION_MODE_FAST: "快速版",
+    GENERATION_MODE_DEEP: "深度版",
+}
+
+# _LOCAL_RUNTIME_CACHE：非 Streamlit 上下文中的兜底内存缓存。
+_LOCAL_RUNTIME_CACHE: dict[str, dict] = {}
+
+# BETA_NOTICE_TEXT：上线前页面底部展示的 Beta 和隐私安全提醒。
+BETA_NOTICE_TEXT = "当前为 Beta 测试版。AI 生成内容仅供参考，门票、预约、开放时间、交通政策等信息请以官方渠道为准。请勿输入身份证号、手机号、住址、护照号等敏感个人信息。"
+
+# SAMPLE_PROMPTS：Hero 输入区的示例旅行需求，点击后会自动填入对话框。
+SAMPLE_PROMPTS = [
+    {"label": "东京3天动漫美食游", "prompt": "我想去东京旅游，喜欢动漫、美食和夜景，预算5000，3 天 2 晚"},
+    {"label": "杭州7天舒适游", "prompt": "杭州7日游，想去西湖、灵隐寺、龙井村，也想吃杭州美食和看夜景，预算一万，要求舒适一点"},
+    {"label": "南京3天 + 江西4天", "prompt": "南京3天，然后去江西4天，喜欢历史文化、美食和夜景，预算8000"},
+    {"label": "大阪京都5日自由行", "prompt": "我想去大阪京都自由行，喜欢历史、美食、购物和拍照，普通预算，5 天 4 晚"},
+]
+
+# TRAVEL_INPUT_NAMESPACE：输入区组件命名空间，避免同类组件在重复渲染时 key 冲突。
+TRAVEL_INPUT_NAMESPACE = "main_input"
+
+# TRAVEL_INPUT_STATE_KEY：保存用户输入原文的 session_state key。
+TRAVEL_INPUT_STATE_KEY = "travel_user_input"
+
+# HERO_DESTINATION_ENGLISH_MAP：Hero 杂志卡片使用的常见目的地英文映射。
+HERO_DESTINATION_ENGLISH_MAP = {
+    "北京": "Beijing",
+    "上海": "Shanghai",
+    "广州": "Guangzhou",
+    "深圳": "Shenzhen",
+    "香港": "Hong Kong",
+    "澳门": "Macau",
+    "南京": "Nanjing",
+    "江西": "Jiangxi",
+    "南昌": "Nanchang",
+    "景德镇": "Jingdezhen",
+    "婺源": "Wuyuan",
+    "庐山": "Lushan",
+    "杭州": "Hangzhou",
+    "苏州": "Suzhou",
+    "成都": "Chengdu",
+    "重庆": "Chongqing",
+    "东京": "Tokyo",
+    "京都": "Kyoto",
+    "大阪": "Osaka",
+    "首尔": "Seoul",
+    "曼谷": "Bangkok",
+}
+
+
+if load_dotenv:
+    # load_dotenv：读取本地 .env 文件，方便初学者不用每次手动设置环境变量。
+    load_dotenv()
+
+
+def get_config_value(config_name: str, default_value: str = "") -> str:
+    """get_config_value：优先从 .env/环境变量读取配置，其次兼容 Streamlit secrets。"""
+
+    # env_value：load_dotenv 后从系统环境变量中读取到的配置值。
+    env_value = os.getenv(config_name)
+    if env_value is not None and str(env_value).strip():
+        return str(env_value).strip()
+
+    try:
+        # secret_value：Streamlit Cloud 部署时可从 st.secrets 读取的配置值。
+        secret_value = st.secrets.get(config_name)
+        if secret_value is not None and str(secret_value).strip():
+            return str(secret_value).strip()
+    except Exception:
+        return default_value
+
+    return default_value
+
+
+def get_bool_config(config_name: str, default_value: bool = False) -> bool:
+    """get_bool_config：把环境变量或 secrets 中的开关配置转换成布尔值。"""
+
+    # raw_value：配置原始字符串。
+    raw_value = get_config_value(config_name, str(default_value)).strip().lower()
+    return raw_value in {"1", "true", "yes", "y", "on", "启用", "是"}
+
+
+def is_debug_enabled() -> bool:
+    """is_debug_enabled：判断是否显示开发者调试信息，默认关闭。"""
+
+    # secret_value：Streamlit Cloud secrets 中的调试开关，优先级最高。
+    secret_value = None
+    try:
+        secret_value = st.secrets.get("SHOW_DEBUG")
+    except Exception:
+        secret_value = None
+
+    if secret_value is not None and str(secret_value).strip():
+        return str(secret_value).strip().lower() in {"true", "1", "yes"}
+
+    # env_value：本地环境变量中的调试开关。
+    env_value = os.getenv("SHOW_DEBUG", "")
+    return str(env_value).strip().lower() in {"true", "1", "yes"}
+
+
+def make_widget_key(prefix: str, *parts) -> str:
+    """make_widget_key：为 Streamlit 交互组件生成稳定且唯一的 key。"""
+
+    # raw_key_text：参与哈希的原始组件上下文，包含模块名、索引、文案和内容摘要等。
+    # 注意：prefix 必须参与哈希计算，避免不同组件因内容巧合产生相同 key。
+    raw_key_text = "|".join(str(part) for part in parts if part is not None)
+    digest = hashlib.md5(f"{prefix}|{raw_key_text}".encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}_{digest}"
+
+
+def get_travel_textarea_key(namespace: str = TRAVEL_INPUT_NAMESPACE) -> str:
+    """get_travel_textarea_key：返回旅行需求输入框的稳定 Streamlit key。"""
+
+    return make_widget_key("travel_textarea", namespace)
+
+
+def get_generation_mode_label(generation_mode: str) -> str:
+    """get_generation_mode_label：把生成模式标识转换成页面展示文案。"""
+
+    return GENERATION_MODE_LABELS.get(generation_mode, "快速版")
+
+
+def get_runtime_cache(cache_name: str) -> dict:
+    """get_runtime_cache：读取当前 session 的轻量运行时缓存。"""
+
+    try:
+        cache_bucket = st.session_state.setdefault(cache_name, {})
+        if isinstance(cache_bucket, dict):
+            return cache_bucket
+    except Exception:
+        pass
+
+    return _LOCAL_RUNTIME_CACHE.setdefault(cache_name, {})
+
+
+def get_cached_runtime_value(cache_name: str, cache_key: str, ttl_seconds: int) -> object | None:
+    """get_cached_runtime_value：按 TTL 读取运行时缓存值。"""
+
+    cache_bucket = get_runtime_cache(cache_name)
+    cache_item = cache_bucket.get(cache_key)
+    if not isinstance(cache_item, dict):
+        return None
+
+    cached_at = float(cache_item.get("cached_at", 0) or 0)
+    if time.time() - cached_at > ttl_seconds:
+        return None
+
+    return cache_item.get("value")
+
+
+def set_cached_runtime_value(cache_name: str, cache_key: str, value: object) -> None:
+    """set_cached_runtime_value：写入运行时缓存值。"""
+
+    cache_bucket = get_runtime_cache(cache_name)
+    cache_bucket[cache_key] = {"cached_at": time.time(), "value": value}
+
+
+def build_generation_cache_key(user_input: str, generation_mode: str) -> str:
+    """build_generation_cache_key：生成输入内容和模式对应的结果缓存 key。"""
+
+    normalized_input = re.sub(r"\s+", " ", user_input.strip())
+    raw_key = f"{generation_mode}|{normalized_input}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def get_int_config(config_name: str, default_value: int) -> int:
+    """get_int_config：读取整数配置，非法值自动使用默认值。"""
+
+    # raw_value：配置原始字符串。
+    raw_value = get_config_value(config_name, str(default_value)).strip()
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default_value
+
+
+def setup_page() -> None:
+    """setup_page：设置 Streamlit 页面基础信息和自定义样式。"""
+
+    st.set_page_config(
+        page_title="AI 旅游攻略 Agent",
+        page_icon="AI",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+
+    # custom_css：控制页面视觉风格，让 Streamlit 默认界面更接近高级旅行杂志和 AI 工具。
+    custom_css = """
+    <style>
+
+    /* v2 foundation: keeps required layout and pseudo-element bases after removing legacy v1 CSS. */
+    *,
+    *::before,
+    *::after {
+        box-sizing: border-box;
+    }
+
+    html,
+    body,
+    .stApp,
+    [data-testid="stAppViewContainer"] {
+        width: 100%;
+        max-width: 100%;
+        overflow-x: hidden !important;
+    }
+
+    [data-testid="stMain"],
+    [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"],
+    [data-testid="column"],
+    [data-testid="stForm"],
+    [data-testid="stTextArea"],
+    [data-testid="stMarkdownContainer"] {
+        max-width: 100%;
+        min-width: 0;
+    }
+
+    img,
+    iframe,
+    table,
+    svg {
+        max-width: 100%;
+    }
+
+    [data-testid="stHeader"] {
+        background: transparent;
+    }
+
+    [data-testid="stToolbar"] {
+        display: none;
+    }
+
+    .stApp::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        mask-image: linear-gradient(180deg, rgba(0,0,0,0.72), transparent 72%);
+    }
+
+    .block-container {
+        width: 100%;
+        padding-bottom: 5rem;
+    }
+
+    .top-nav,
+    .nav-brand,
+    .nav-links,
+    .hero-proof,
+    .cover-badges,
+    .food-meta,
+    .card-title-row,
+    .weather-meta,
+    .result-action-grid,
+    .trust-strip {
+        display: flex;
+    }
+
+    .top-nav,
+    .nav-brand,
+    .nav-links,
+    .hero-proof,
+    .cover-badges,
+    .food-meta,
+    .card-title-row,
+    .weather-meta {
+        align-items: center;
+    }
+
+    .top-nav {
+        justify-content: space-between;
+        gap: 1rem;
+        border-radius: 999px;
+    }
+
+    .nav-brand {
+        gap: 0.7rem;
+        font-weight: 800;
+    }
+
+    .brand-mark,
+    .slot-icon,
+    .weather-icon,
+    .info-icon,
+    .warning-icon {
+        display: grid;
+        place-items: center;
+        flex: 0 0 auto;
+        font-weight: 900;
+    }
+
+    .brand-mark {
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+    }
+
+    .nav-links,
+    .hero-proof,
+    .cover-badges,
+    .food-meta,
+    .weather-meta,
+    .result-action-grid,
+    .trust-strip {
+        flex-wrap: wrap;
+    }
+
+    .nav-links {
+        gap: 1rem;
+        font-size: 0.92rem;
+    }
+
+    .nav-links span,
+    .hero-proof span,
+    .cover-badge,
+    .food-meta span {
+        border-radius: 999px;
+    }
+
+    .hero {
+        position: relative;
+        margin-bottom: 1.75rem;
+    }
+
+    .hero-layout,
+    .bento-grid,
+    .segment-overview-grid,
+    .timeline-grid,
+    .food-grid,
+    .info-grid,
+    .warning-grid,
+    .weather-grid,
+    .budget-grid,
+    .checklist-grid,
+    .photo-grid {
+        display: grid;
+        max-width: 100%;
+    }
+
+    .hero-layout {
+        grid-template-columns: minmax(0, 1.16fr) minmax(280px, 0.84fr);
+        gap: 1.35rem;
+        align-items: stretch;
+    }
+
+    .hero p,
+    .section-subtitle,
+    .cover-content p {
+        margin-top: 1rem;
+    }
+
+    .hero-panel,
+    .cover-card,
+    .timeline-day,
+    .food-card,
+    .info-card,
+    .warning-card,
+    .weather-card,
+    .budget-card,
+    .segment-card,
+    .checklist-card,
+    .photo-card,
+    .trust-card,
+    .weather-fallback,
+    .blessing-card {
+        position: relative;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        padding: 1.1rem;
+    }
+
+    .cover-card {
+        aspect-ratio: 16 / 9;
+        background-size: cover;
+        background-position: center;
+        overflow: hidden;
+        margin: 2.15rem 0 1.45rem;
+    }
+
+    .cover-card::before,
+    .cover-card::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+    }
+
+    .cover-content {
+        position: absolute;
+        inset: auto clamp(1.25rem, 4vw, 3.2rem) clamp(1.25rem, 4vw, 3.2rem) clamp(1.25rem, 4vw, 3.2rem);
+    }
+
+    .bento-grid {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-auto-rows: minmax(112px, auto);
+        gap: 0.9rem;
+        margin: 1rem 0 2rem;
+    }
+
+    .segment-overview-grid,
+    .timeline-grid,
+    .food-grid,
+    .info-grid,
+    .warning-grid,
+    .checklist-grid,
+    .photo-grid,
+    .weather-grid,
+    .budget-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+        margin-bottom: 1.6rem;
+    }
+
+    .timeline-slot,
+    .weather-day {
+        display: grid;
+        gap: 0.85rem;
+    }
+
+    .timeline-slot {
+        grid-template-columns: 44px minmax(0, 1fr);
+    }
+
+    .weather-day {
+        grid-template-columns: 48px minmax(0, 1fr);
+    }
+
+    .slot-icon,
+    .weather-icon,
+    .info-icon,
+    .warning-icon {
+        width: 40px;
+        height: 40px;
+        border-radius: 14px;
+    }
+
+    .checklist-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: grid;
+        gap: 0.54rem;
+    }
+
+    .photo-meta {
+        display: grid;
+        gap: 0.45rem;
+        margin-top: 0.72rem;
+    }
+
+    /* =========================
+       TripAgent Product UI v2
+       ========================= */
+    :root {
+        --v2-bg-a: #060711;
+        --v2-bg-b: #111827;
+        --v2-ink: #fff7ed;
+        --v2-muted: #a7b0c0;
+        --v2-gold: #f7d58a;
+        --v2-gold-2: #f59e0b;
+        --v2-ice: #9bdcff;
+        --v2-card: rgba(12, 18, 34, 0.66);
+        --v2-card-strong: rgba(8, 13, 26, 0.82);
+        --v2-line: rgba(255, 244, 214, 0.16);
+        --v2-line-bright: rgba(247, 213, 138, 0.34);
+        --v2-shadow: 0 28px 100px rgba(0, 0, 0, 0.42);
+    }
+
+    html,
+    body,
+    .stApp,
+    [data-testid="stAppViewContainer"] {
+        width: 100%;
+        max-width: 100%;
+        overflow-x: hidden !important;
+    }
+
+    .stApp {
+        background:
+            radial-gradient(circle at 16% 8%, rgba(247, 213, 138, 0.22), transparent 28%),
+            radial-gradient(circle at 82% 12%, rgba(155, 220, 255, 0.15), transparent 26%),
+            radial-gradient(circle at 70% 86%, rgba(245, 158, 11, 0.15), transparent 34%),
+            linear-gradient(145deg, #050611 0%, #0b1020 42%, #171923 72%, #060711 100%) !important;
+        color: var(--v2-ink);
+    }
+
+    .stApp::before {
+        background-image:
+            linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(247, 213, 138, 0.035) 1px, transparent 1px) !important;
+        background-size: 92px 92px;
+        opacity: 0.42;
+    }
+
+    .block-container {
+        max-width: 1240px !important;
+        padding-top: 1rem !important;
+    }
+
+    .top-nav {
+        position: sticky;
+        top: 0.7rem;
+        z-index: 5;
+        margin-bottom: 1.6rem !important;
+        padding: 0.74rem 0.92rem !important;
+        border: 1px solid var(--v2-line-bright) !important;
+        background:
+            linear-gradient(135deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.035)),
+            rgba(8, 12, 24, 0.78) !important;
+        box-shadow: 0 18px 58px rgba(0, 0, 0, 0.34);
+    }
+
+    .brand-mark {
+        background: linear-gradient(135deg, #fff2bf, #f7d58a 45%, #f59e0b) !important;
+        box-shadow: 0 0 0 1px rgba(255,255,255,0.34), 0 0 34px rgba(247, 213, 138, 0.22) !important;
+    }
+
+    .nav-links span {
+        color: #f8fafc !important;
+        border: 1px solid transparent;
+    }
+
+    .nav-links span:hover {
+        border-color: rgba(247, 213, 138, 0.2);
+        background: rgba(247, 213, 138, 0.08);
+    }
+
+    .hero.product-hero {
+        position: relative;
+        padding: clamp(1.1rem, 3vw, 2rem);
+        border: 1px solid rgba(247, 213, 138, 0.20);
+        border-radius: 34px;
+        background:
+            linear-gradient(135deg, rgba(255, 255, 255, 0.115), rgba(255, 255, 255, 0.035)),
+            radial-gradient(circle at 10% 0%, rgba(247, 213, 138, 0.15), transparent 38%),
+            radial-gradient(circle at 90% 12%, rgba(155, 220, 255, 0.10), transparent 32%),
+            rgba(9, 14, 28, 0.62);
+        box-shadow: var(--v2-shadow);
+        backdrop-filter: blur(26px);
+        overflow: hidden;
+        margin-bottom: 1.2rem;
+    }
+
+    .hero.product-hero::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background:
+            linear-gradient(90deg, transparent 0 8%, rgba(247, 213, 138, 0.12) 8% 8.12%, transparent 8.12%),
+            linear-gradient(180deg, transparent 0 18%, rgba(255, 255, 255, 0.08) 18% 18.12%, transparent 18.12%);
+        opacity: 0.55;
+    }
+
+    .hero.product-hero::after {
+        display: none;
+    }
+
+    .hero-layout {
+        position: relative;
+        z-index: 1;
+        grid-template-columns: minmax(0, 1.06fr) minmax(330px, 0.94fr) !important;
+        gap: clamp(1rem, 2.4vw, 2rem) !important;
+        align-items: center !important;
+    }
+
+    .eyebrow {
+        border-color: rgba(247, 213, 138, 0.36) !important;
+        color: #fff2bf !important;
+        background: rgba(247, 213, 138, 0.10) !important;
+        box-shadow: 0 12px 38px rgba(245, 158, 11, 0.13);
+    }
+
+    .hero h1,
+    .hero-title {
+        max-width: 900px;
+        margin: 0.35rem 0 0.85rem !important;
+        padding: 0.08rem 0;
+        font-size: clamp(3rem, 5.8vw, 4.5rem) !important;
+        line-height: 1.1 !important;
+        color: transparent !important;
+        background: linear-gradient(102deg, #fff7ed 0%, #f7d58a 58%, #9bdcff 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        text-wrap: balance;
+        overflow-wrap: break-word;
+    }
+
+    .hero-title-line {
+        display: inline;
+    }
+
+    .hero p {
+        max-width: 720px;
+        color: #d7dbe5 !important;
+        font-size: clamp(1rem, 1.8vw, 1.22rem) !important;
+        line-height: 1.85 !important;
+    }
+
+    .hero-proof span {
+        border-color: rgba(247, 213, 138, 0.20) !important;
+        background: rgba(255, 255, 255, 0.07) !important;
+    }
+
+    .hero-panel.product-preview {
+        min-height: 430px;
+        border: 1px solid rgba(247, 213, 138, 0.24) !important;
+        border-radius: 30px !important;
+        padding: 1.1rem !important;
+        background:
+            radial-gradient(circle at 20% 10%, rgba(247, 213, 138, 0.18), transparent 34%),
+            linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.035)),
+            rgba(6, 10, 22, 0.72) !important;
+        overflow: hidden;
+    }
+
+    .preview-cover {
+        position: relative;
+        min-height: 176px;
+        border-radius: 24px;
+        border: 1px solid rgba(247, 213, 138, 0.22);
+        background:
+            linear-gradient(120deg, rgba(2, 6, 23, 0.08), rgba(2, 6, 23, 0.86)),
+            radial-gradient(circle at 18% 16%, rgba(247, 213, 138, 0.58), transparent 22%),
+            radial-gradient(circle at 80% 18%, rgba(56, 189, 248, 0.22), transparent 24%),
+            linear-gradient(135deg, #1e293b, #78350f 56%, #020617);
+        box-shadow: 0 20px 65px rgba(0, 0, 0, 0.32);
+        overflow: hidden;
+    }
+
+    .preview-cover::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+            linear-gradient(90deg, transparent 0 9%, rgba(255, 247, 237, 0.09) 9% 9.2%, transparent 9.2%),
+            linear-gradient(180deg, transparent 0 24%, rgba(255, 247, 237, 0.08) 24% 24.15%, transparent 24.15%);
+        opacity: 0.48;
+        pointer-events: none;
+    }
+
+    .preview-cover::after {
+        content: "";
+        position: absolute;
+        inset: 18px;
+        border: 1px solid rgba(255, 247, 237, 0.18);
+        border-radius: 18px;
+    }
+
+    .preview-cover-art {
+        position: absolute;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+    }
+
+    .preview-illustration {
+        position: absolute;
+        right: -6px;
+        bottom: -4px;
+        width: min(72%, 300px);
+        height: auto;
+        opacity: 0.78;
+        filter: drop-shadow(0 18px 36px rgba(0, 0, 0, 0.34));
+    }
+
+    .preview-route-arc {
+        position: absolute;
+        left: 22px;
+        top: 24px;
+        width: 58%;
+        height: 62%;
+        border-top: 1px dashed rgba(253, 236, 200, 0.42);
+        border-radius: 999px;
+        transform: rotate(-10deg);
+        opacity: 0.75;
+    }
+
+    .preview-route-arc::before,
+    .preview-route-arc::after {
+        content: "";
+        position: absolute;
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #f7d58a;
+        box-shadow: 0 0 18px rgba(247, 213, 138, 0.62);
+    }
+
+    .preview-route-arc::before {
+        left: 3px;
+        top: -4px;
+    }
+
+    .preview-route-arc::after {
+        right: 18px;
+        top: -5px;
+        background: #9bdcff;
+        box-shadow: 0 0 18px rgba(155, 220, 255, 0.55);
+    }
+
+    .preview-cover-label {
+        position: absolute;
+        left: 1rem;
+        bottom: 1rem;
+        right: 1rem;
+        z-index: 2;
+    }
+
+    .preview-cover-label span {
+        display: block;
+        color: #f7d58a;
+        font-size: 0.76rem;
+        letter-spacing: 0.08rem;
+        text-transform: uppercase;
+        margin-bottom: 0.35rem;
+    }
+
+    .preview-cover-label strong {
+        display: block;
+        max-width: 100%;
+        font-size: clamp(1.32rem, 2.1vw, 1.7rem);
+        color: #fff7ed;
+        line-height: 1.1;
+        overflow-wrap: anywhere;
+        text-shadow: 0 12px 32px rgba(0, 0, 0, 0.52);
+    }
+
+    .preview-cover.history {
+        background:
+            linear-gradient(120deg, rgba(2, 6, 23, 0.12), rgba(2, 6, 23, 0.86)),
+            radial-gradient(circle at 18% 16%, rgba(247, 213, 138, 0.58), transparent 22%),
+            linear-gradient(135deg, #27180f, #92400e 58%, #020617);
+    }
+
+    .preview-cover.night {
+        background:
+            linear-gradient(120deg, rgba(2, 6, 23, 0.06), rgba(2, 6, 23, 0.88)),
+            radial-gradient(circle at 78% 18%, rgba(56, 189, 248, 0.34), transparent 24%),
+            linear-gradient(135deg, #0f172a, #312e81 54%, #020617);
+    }
+
+    .preview-cover.sea {
+        background:
+            linear-gradient(120deg, rgba(2, 6, 23, 0.08), rgba(2, 6, 23, 0.82)),
+            radial-gradient(circle at 20% 18%, rgba(253, 236, 200, 0.48), transparent 22%),
+            linear-gradient(135deg, #0f2f3d, #0f766e 58%, #020617);
+    }
+
+    .preview-cover.food {
+        background:
+            linear-gradient(120deg, rgba(2, 6, 23, 0.08), rgba(2, 6, 23, 0.84)),
+            radial-gradient(circle at 20% 16%, rgba(251, 146, 60, 0.48), transparent 22%),
+            linear-gradient(135deg, #2a170c, #9a3412 58%, #020617);
+    }
+
+    .preview-cover.photo {
+        background:
+            linear-gradient(120deg, rgba(2, 6, 23, 0.08), rgba(2, 6, 23, 0.84)),
+            radial-gradient(circle at 78% 18%, rgba(155, 220, 255, 0.30), transparent 24%),
+            linear-gradient(135deg, #172033, #4c1d95 58%, #020617);
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.input-kicker) {
+        position: relative;
+        border: 1px solid rgba(247, 213, 138, 0.25) !important;
+        border-radius: 30px !important;
+        background:
+            linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.034)),
+            rgba(8, 13, 26, 0.72) !important;
+        box-shadow: 0 24px 86px rgba(0, 0, 0, 0.34), 0 0 0 1px rgba(255,255,255,0.035) inset !important;
+        backdrop-filter: blur(26px);
+        overflow: hidden;
+        padding: 0.4rem !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.input-kicker)::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background: radial-gradient(circle at 6% 0%, rgba(247, 213, 138, 0.16), transparent 34%);
+    }
+
+    .input-kicker {
+        color: #f7d58a !important;
+        letter-spacing: 0.12rem;
+    }
+
+    .input-title {
+        color: #fff7ed !important;
+        font-size: 1.26rem !important;
+    }
+
+    .sample-title,
+    .hint {
+        color: #aeb8ca !important;
+    }
+
+    .stTextArea textarea {
+        min-height: 170px !important;
+        border-radius: 24px !important;
+        border: 1px solid rgba(247, 213, 138, 0.36) !important;
+        background:
+            linear-gradient(145deg, rgba(2,6,23,0.88), rgba(15,23,42,0.70)) !important;
+        box-shadow: 0 18px 58px rgba(0,0,0,0.26), 0 0 0 1px rgba(255,255,255,0.045) inset !important;
+    }
+
+    .stButton > button,
+    .stFormSubmitButton > button,
+    .stDownloadButton > button {
+        min-height: 44px;
+        border: 1px solid rgba(255, 247, 237, 0.24) !important;
+        border-radius: 999px !important;
+        background:
+            linear-gradient(135deg, #fff2bf 0%, #f7d58a 36%, #f59e0b 100%) !important;
+        color: #16120b !important;
+        box-shadow: 0 15px 38px rgba(245, 158, 11, 0.22) !important;
+        font-weight: 900 !important;
+    }
+
+    .cover-card {
+        min-height: 520px !important;
+        border-radius: 36px !important;
+        border: 1px solid rgba(247, 213, 138, 0.30) !important;
+        box-shadow: 0 42px 130px rgba(0, 0, 0, 0.52), 0 0 80px rgba(247, 213, 138, 0.08) inset !important;
+        isolation: isolate;
+    }
+
+    .cover-card::before {
+        z-index: 2 !important;
+        background:
+            linear-gradient(90deg, rgba(247, 213, 138, 0.20) 1px, transparent 1px),
+            linear-gradient(180deg, rgba(255,255,255,0.09) 1px, transparent 1px),
+            radial-gradient(circle at 88% 18%, rgba(155, 220, 255, 0.18), transparent 28%) !important;
+        background-size: 94px 94px, 94px 94px, 100% 100% !important;
+        opacity: 0.5 !important;
+    }
+
+    .cover-card::after {
+        background:
+            linear-gradient(90deg, rgba(2, 6, 23, 0.88), rgba(2, 6, 23, 0.34) 56%, rgba(2, 6, 23, 0.78)),
+            linear-gradient(180deg, rgba(2, 6, 23, 0.02), rgba(2, 6, 23, 0.88)) !important;
+    }
+
+    .cover-content {
+        z-index: 3 !important;
+    }
+
+    .cover-content .label {
+        color: #f7d58a !important;
+        letter-spacing: 0.18rem !important;
+    }
+
+    .cover-content h2 {
+        color: #fff7ed !important;
+        font-size: clamp(3rem, 7vw, 6.4rem) !important;
+        text-shadow: 0 22px 80px rgba(0,0,0,0.5);
+    }
+
+    .cover-dayline {
+        color: #fff2bf !important;
+        font-size: clamp(1.1rem, 2.4vw, 1.6rem) !important;
+    }
+
+    .cover-badge,
+    .weather-meta span,
+    .food-meta span {
+        border-color: rgba(247, 213, 138, 0.24) !important;
+        background: rgba(247, 213, 138, 0.10) !important;
+        color: #fff2bf !important;
+    }
+
+    .section-heading {
+        margin-top: 2.6rem !important;
+        font-size: clamp(1.7rem, 3vw, 2.35rem) !important;
+        color: #fff7ed !important;
+    }
+
+    .section-heading::after {
+        content: "";
+        display: block;
+        width: 86px;
+        height: 2px;
+        margin-top: 0.45rem;
+        background: linear-gradient(90deg, #f7d58a, transparent);
+    }
+
+    .section-subtitle {
+        color: #aeb8ca !important;
+        max-width: 820px;
+    }
+
+    .bento-grid {
+        grid-template-columns: repeat(6, minmax(0, 1fr)) !important;
+        gap: 1rem !important;
+    }
+
+    .bento-card {
+        grid-column: span 2;
+        min-height: 148px !important;
+        border-radius: 28px !important;
+        border: 1px solid rgba(247, 213, 138, 0.18) !important;
+        background:
+            linear-gradient(145deg, rgba(255,255,255,0.105), rgba(255,255,255,0.026)),
+            rgba(10, 16, 31, 0.64) !important;
+        box-shadow: 0 22px 76px rgba(0, 0, 0, 0.28) !important;
+    }
+
+    .bento-card.large {
+        grid-column: span 3 !important;
+    }
+
+    .bento-card.warm {
+        background:
+            radial-gradient(circle at 12% 10%, rgba(247, 213, 138, 0.18), transparent 38%),
+            linear-gradient(145deg, rgba(247, 213, 138, 0.14), rgba(255,255,255,0.03)),
+            rgba(10, 16, 31, 0.64) !important;
+    }
+
+    .bento-card span,
+    .segment-card span {
+        color: #f7d58a !important;
+        letter-spacing: 0.04rem;
+        text-transform: uppercase;
+    }
+
+    .bento-card strong {
+        color: #fff7ed !important;
+        font-size: clamp(1.25rem, 2.2vw, 1.68rem) !important;
+    }
+
+    .timeline-grid {
+        grid-template-columns: minmax(0, 1fr) !important;
+        gap: 1.25rem !important;
+    }
+
+    .timeline-day {
+        position: relative;
+        border-radius: 30px !important;
+        border: 1px solid rgba(247, 213, 138, 0.18) !important;
+        background:
+            linear-gradient(145deg, rgba(255,255,255,0.105), rgba(255,255,255,0.026)),
+            rgba(10, 16, 31, 0.66) !important;
+        box-shadow: 0 24px 86px rgba(0,0,0,0.30) !important;
+        padding: 1.25rem 1.25rem 1.25rem 1.45rem !important;
+        overflow: hidden;
+    }
+
+    .timeline-day::before {
+        content: "";
+        position: absolute;
+        left: 2.05rem;
+        top: 4.6rem;
+        bottom: 1.4rem;
+        width: 1px;
+        background: linear-gradient(180deg, #f7d58a, rgba(247, 213, 138, 0.05));
+    }
+
+    .timeline-day h3 {
+        font-size: clamp(1.2rem, 2vw, 1.55rem) !important;
+        color: #fff7ed !important;
+        padding-left: 0.2rem;
+    }
+
+    .timeline-slot {
+        position: relative;
+        grid-template-columns: 54px minmax(0, 1fr) !important;
+        gap: 1rem !important;
+        border-top: 0 !important;
+        padding: 0.7rem 0 !important;
+    }
+
+    .slot-icon {
+        position: relative;
+        z-index: 1;
+        width: 46px !important;
+        height: 46px !important;
+        border-radius: 16px !important;
+        background: linear-gradient(135deg, #fff2bf, #f59e0b) !important;
+        box-shadow: 0 14px 32px rgba(245, 158, 11, 0.23) !important;
+    }
+
+    .timeline-slot > div:nth-child(2) {
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 20px;
+        background: rgba(255,255,255,0.045);
+        padding: 0.86rem 0.92rem;
+    }
+
+    .slot-time,
+    .slot-original,
+    .weather-date {
+        color: #f7d58a !important;
+    }
+
+    .slot-place,
+    .weather-main {
+        color: #fff7ed !important;
+    }
+
+    .slot-meta-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+    }
+
+    .slot-meta-item {
+        border-color: rgba(247, 213, 138, 0.12) !important;
+        background: rgba(7, 11, 22, 0.46) !important;
+    }
+
+    .food-grid,
+    .info-grid,
+    .warning-grid,
+    .weather-grid,
+    .budget-grid,
+    .checklist-grid,
+    .photo-grid {
+        gap: 1rem !important;
+    }
+
+    .food-card,
+    .info-card,
+    .warning-card,
+    .weather-card,
+    .budget-card,
+    .segment-card,
+    .checklist-card,
+    .photo-card {
+        border-radius: 28px !important;
+        border: 1px solid rgba(247, 213, 138, 0.17) !important;
+        background:
+            linear-gradient(145deg, rgba(255,255,255,0.10), rgba(255,255,255,0.025)),
+            rgba(10, 16, 31, 0.64) !important;
+        box-shadow: 0 22px 76px rgba(0,0,0,0.28) !important;
+    }
+
+    .budget-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+        max-width: 100%;
+        margin-bottom: 1.6rem;
+    }
+
+    .budget-card {
+        min-width: 0;
+        padding: 1rem;
+    }
+
+    .budget-card span {
+        display: block;
+        color: #f7d58a;
+        font-size: 0.78rem;
+        letter-spacing: 0.04rem;
+        margin-bottom: 0.38rem;
+        text-transform: uppercase;
+    }
+
+    .budget-card p {
+        color: #cbd5e1;
+        line-height: 1.62;
+        margin: 0;
+        overflow-wrap: anywhere;
+    }
+
+    .bento-card {
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: center !important;
+        align-items: flex-start !important;
+        gap: 0.5rem !important;
+        padding: 1.5rem 1.75rem !important;
+    }
+
+    .bento-card span {
+        display: block !important;
+        margin-bottom: 0.15rem !important;
+        line-height: 1.3 !important;
+    }
+
+    .bento-card strong {
+        display: block !important;
+        width: 100% !important;
+        line-height: 1.2 !important;
+        white-space: normal !important;
+        overflow: visible !important;
+        word-break: break-word !important;
+        overflow-wrap: anywhere !important;
+    }
+
+    .bento-card p {
+        margin-top: 0.15rem !important;
+        line-height: 1.55 !important;
+    }
+
+    .budget-card {
+        padding: 1.5rem 1.75rem !important;
+        overflow: visible !important;
+    }
+
+    .budget-card p,
+    .budget-amount {
+        display: block !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        padding-left: 0 !important;
+        margin-left: 0 !important;
+        transform: none !important;
+        overflow: visible !important;
+        white-space: normal !important;
+        text-overflow: unset !important;
+        word-break: keep-all !important;
+        overflow-wrap: anywhere !important;
+    }
+
+    .food-card {
+        position: relative;
+        overflow: hidden;
+    }
+
+    .food-card::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background: radial-gradient(circle at 88% 10%, rgba(247, 213, 138, 0.13), transparent 28%);
+    }
+
+    .food-card h3 {
+        position: relative;
+        color: #fff7ed !important;
+        font-size: 1.22rem;
+    }
+
+    .food-location,
+    .food-map-keyword {
+        position: relative;
+        color: #aeb8ca !important;
+    }
+
+    .weather-card h3,
+    .info-card h3,
+    .warning-card h3 {
+        color: #fff7ed !important;
+    }
+
+    .weather-day {
+        border-top-color: rgba(247, 213, 138, 0.10) !important;
+    }
+
+    .weather-icon,
+    .info-icon,
+    .warning-icon {
+        background: linear-gradient(135deg, #fff2bf, #f59e0b) !important;
+        color: #17120a !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.result-actions-title),
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.source-card-title) {
+        border-radius: 28px !important;
+        border: 1px solid rgba(247, 213, 138, 0.20) !important;
+        background:
+            linear-gradient(145deg, rgba(255,255,255,0.10), rgba(255,255,255,0.03)),
+            rgba(10, 16, 31, 0.64) !important;
+        box-shadow: 0 22px 76px rgba(0,0,0,0.28) !important;
+    }
+
+    .result-actions-title,
+    .source-card-title {
+        color: #fff7ed;
+        font-size: 1.25rem;
+        font-weight: 900;
+        margin: 0 0 0.35rem;
+    }
+
+    .source-card-text {
+        color: #cbd5e1;
+        line-height: 1.65;
+        margin: 0.25rem 0;
+    }
+
+    .search-status-pill,
+    .trust-card,
+    .weather-fallback,
+    .blessing-card {
+        border-color: rgba(247, 213, 138, 0.18) !important;
+        background:
+            linear-gradient(145deg, rgba(247, 213, 138, 0.10), rgba(255,255,255,0.025)),
+            rgba(10, 16, 31, 0.60) !important;
+    }
+
+    @media (max-width: 768px) {
+        .block-container {
+            padding: 0.72rem 0.68rem 3rem !important;
+        }
+
+        .top-nav {
+            position: static;
+            border-radius: 22px !important;
+            margin-bottom: 0.9rem !important;
+        }
+
+        .hero.product-hero {
+            border-radius: 26px;
+            padding: 1rem;
+        }
+
+        .hero-layout,
+        .bento-grid,
+        .timeline-grid,
+        .food-grid,
+        .info-grid,
+        .warning-grid,
+        .checklist-grid,
+        .photo-grid,
+        .weather-grid,
+        .budget-grid,
+        .segment-overview-grid,
+        .trust-strip,
+        .result-action-grid,
+        .slot-meta-grid {
+            grid-template-columns: minmax(0, 1fr) !important;
+            width: 100% !important;
+        }
+
+        .hero h1,
+        .hero-title {
+            max-width: min(100%, 900px);
+            margin: 0.55rem 0 1rem !important;
+            font-size: clamp(2.375rem, 10.8vw, 2.875rem) !important;
+            line-height: 1.12 !important;
+            letter-spacing: 0 !important;
+        }
+
+        .hero-title-line {
+            display: block;
+        }
+
+        .hero p {
+            font-size: 0.96rem !important;
+            line-height: 1.65 !important;
+        }
+
+        .hero-panel.product-preview {
+            min-height: auto;
+            width: 100%;
+        }
+
+        .preview-cover {
+            min-height: 150px;
+        }
+
+        .preview-illustration {
+            width: 74%;
+            right: -18px;
+            opacity: 0.42;
+        }
+
+        .preview-route-arc {
+            width: 66%;
+            opacity: 0.45;
+        }
+
+        .preview-cover-label strong {
+            font-size: clamp(1.12rem, 6.2vw, 1.52rem);
+            line-height: 1.14;
+        }
+
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.input-kicker) {
+            border-radius: 24px !important;
+        }
+
+        .stTextArea textarea {
+            min-height: 128px !important;
+        }
+
+        .cover-card {
+            min-height: 300px !important;
+            aspect-ratio: 4 / 3 !important;
+            border-radius: 26px !important;
+        }
+
+        .cover-content h2 {
+            font-size: clamp(2rem, 12vw, 3.3rem) !important;
+        }
+
+        .bento-card,
+        .bento-card.large {
+            grid-column: span 1 !important;
+            min-height: auto !important;
+        }
+
+        .timeline-day::before {
+            left: 1.55rem;
+            top: 4.5rem;
+        }
+
+        .timeline-slot {
+            grid-template-columns: 42px minmax(0, 1fr) !important;
+            gap: 0.72rem !important;
+        }
+
+        .slot-icon {
+            width: 36px !important;
+            height: 36px !important;
+            border-radius: 13px !important;
+            font-size: 0.76rem !important;
+        }
+
+        .timeline-slot > div:nth-child(2) {
+            padding: 0.72rem;
+            border-radius: 17px;
+        }
+
+        .weather-day {
+            grid-template-columns: 38px minmax(0, 1fr) !important;
+        }
+
+        .weather-meta span,
+        .food-meta span {
+            width: 100%;
+        }
+
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+            min-width: 0 !important;
+        }
+
+        .stButton > button,
+        .stFormSubmitButton > button,
+        .stDownloadButton > button {
+            width: 100% !important;
+            white-space: normal !important;
+        }
+    }
+
+    @media (max-width: 520px) {
+        .hero-proof span {
+            width: 100%;
+        }
+
+        .section-heading {
+            font-size: 1.45rem !important;
+        }
+
+        .cover-content {
+            inset: auto 0.9rem 0.95rem 0.9rem !important;
+        }
+    }
+
+    /* UI readability hardening：统一修复卡片文字、金额、时间和数字被裁切的问题。 */
+    .section-heading,
+    .section-subtitle,
+    .hero h1,
+    .hero p,
+    .cover-content,
+    .cover-content .label,
+    .cover-content h2,
+    .cover-content p,
+    .cover-dayline,
+    .cover-badge,
+    .bento-card,
+    .bento-card span,
+    .bento-card strong,
+    .bento-card p,
+    .segment-card,
+    .segment-card span,
+    .segment-card strong,
+    .segment-card p,
+    .timeline-day,
+    .timeline-day h3,
+    .slot-time,
+    .slot-place,
+    .slot-original,
+    .slot-desc,
+    .slot-meta-item,
+    .food-card,
+    .food-card h3,
+    .food-location,
+    .food-map-keyword,
+    .food-card p,
+    .info-card,
+    .info-card h3,
+    .info-card p,
+    .warning-card,
+    .warning-card h3,
+    .warning-card p,
+    .budget-card,
+    .budget-card span,
+    .budget-card p,
+    .weather-card,
+    .weather-card h3,
+    .weather-date,
+    .weather-main,
+    .weather-meta span,
+    .weather-advice,
+    .checklist-card,
+    .checklist-card h3,
+    .checklist-list li,
+    .photo-card,
+    .photo-card h3,
+    .photo-card p,
+    .photo-meta span,
+    .trust-card,
+    .trust-card strong,
+    .trust-card p {
+        max-width: 100% !important;
+        min-width: 0 !important;
+        white-space: normal !important;
+        text-overflow: clip !important;
+        word-break: break-word !important;
+        overflow-wrap: anywhere !important;
+        letter-spacing: 0 !important;
+    }
+
+    .hero h1,
+    .hero-title,
+    .cover-content h2 {
+        line-height: 1.1 !important;
+    }
+
+    .bento-card,
+    .segment-card,
+    .timeline-day,
+    .timeline-slot > div:nth-child(2),
+    .food-card,
+    .info-card,
+    .warning-card,
+    .budget-card,
+    .weather-card,
+    .checklist-card,
+    .photo-card,
+    .trust-card {
+        height: auto !important;
+        min-height: auto !important;
+        max-height: none !important;
+        overflow: visible !important;
+    }
+
+    .bento-card strong,
+    .segment-card strong,
+    .budget-card p,
+    .food-map-keyword,
+    .slot-time,
+    .slot-meta-item,
+    .weather-meta span,
+    .cover-dayline {
+        font-variant-numeric: tabular-nums;
+    }
+
+    .stButton > button,
+    .stFormSubmitButton > button,
+    .stDownloadButton > button {
+        height: auto !important;
+        min-height: 44px !important;
+        max-height: none !important;
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        line-height: 1.35 !important;
+        overflow-wrap: anywhere !important;
+    }
+
+    .cover-card {
+        min-height: clamp(320px, 48vw, 520px) !important;
+    }
+
+    .cover-content {
+        max-width: calc(100% - clamp(1.8rem, 7vw, 6.4rem));
+    }
+
+    .cover-content h2 {
+        font-size: clamp(2.05rem, 6vw, 5.2rem) !important;
+        text-wrap: balance;
+    }
+
+    .cover-content p {
+        line-height: 1.68 !important;
+    }
+
+    .bento-card strong {
+        font-size: clamp(1.05rem, 2vw, 1.55rem) !important;
+        line-height: 1.22 !important;
+    }
+
+    .section-heading {
+        line-height: 1.18 !important;
+        text-wrap: balance;
+    }
+
+    .budget-card span,
+    .food-map-keyword,
+    .slot-meta-item,
+    .weather-meta span {
+        font-size: clamp(0.76rem, 1.4vw, 0.88rem) !important;
+        line-height: 1.5 !important;
+    }
+
+    .food-card {
+        position: relative !important;
+        isolation: isolate;
+        padding: clamp(1rem, 2.2vw, 1.28rem) !important;
+    }
+
+    .food-card::before {
+        z-index: 0;
+    }
+
+    .food-card > *:not(.food-illustration) {
+        position: relative;
+        z-index: 2;
+    }
+
+    .food-card h3,
+    .food-card .food-original-name,
+    .food-card .food-location {
+        padding-right: clamp(4.8rem, 10vw, 6.6rem);
+    }
+
+    .food-card h3 {
+        font-size: clamp(1.05rem, 2vw, 1.32rem) !important;
+        line-height: 1.26 !important;
+        margin-bottom: 0.42rem !important;
+    }
+
+    .food-location {
+        margin: 0.28rem 0 0.72rem !important;
+        font-size: clamp(0.8rem, 1.4vw, 0.9rem) !important;
+    }
+
+    .food-card p {
+        font-size: clamp(0.9rem, 1.5vw, 0.98rem) !important;
+        line-height: 1.68 !important;
+    }
+
+    .food-illustration {
+        position: absolute;
+        top: 0.82rem;
+        right: 0.86rem;
+        width: clamp(64px, 9vw, 92px);
+        height: clamp(64px, 9vw, 92px);
+        z-index: 1;
+        pointer-events: none;
+        opacity: 0.46;
+        filter: drop-shadow(0 14px 24px rgba(0, 0, 0, 0.24));
+    }
+
+    .food-illustration::before,
+    .food-illustration::after,
+    .food-illustration-core,
+    .food-illustration-steam {
+        content: "";
+        position: absolute;
+        display: block;
+    }
+
+    .food-illustration::before {
+        inset: 4px;
+        border: 1px solid rgba(247, 213, 138, 0.28);
+        border-radius: 28px;
+        background:
+            radial-gradient(circle at 35% 28%, rgba(255, 242, 191, 0.18), transparent 34%),
+            linear-gradient(145deg, rgba(247, 213, 138, 0.08), rgba(56, 189, 248, 0.04));
+    }
+
+    .food-illustration-core {
+        left: 18%;
+        right: 18%;
+        bottom: 20%;
+        height: 26%;
+        border: 2px solid rgba(253, 230, 138, 0.72);
+        border-top: 0;
+        border-radius: 0 0 999px 999px;
+        background: linear-gradient(180deg, rgba(253, 230, 138, 0.20), rgba(251, 146, 60, 0.08));
+    }
+
+    .food-illustration-steam,
+    .food-illustration::after {
+        top: 18%;
+        height: 28%;
+        width: 14%;
+        border-left: 2px solid rgba(253, 230, 138, 0.58);
+        border-radius: 999px;
+    }
+
+    .food-illustration-steam {
+        left: 38%;
+        transform: rotate(12deg);
+    }
+
+    .food-illustration::after {
+        left: 56%;
+        transform: rotate(-10deg);
+    }
+
+    .food-illustration-dessert .food-illustration-core {
+        left: 36%;
+        right: 30%;
+        bottom: 16%;
+        height: 46%;
+        border: 2px solid rgba(253, 230, 138, 0.74);
+        border-radius: 8px 8px 18px 18px;
+    }
+
+    .food-illustration-dessert::after {
+        left: 28%;
+        top: 18%;
+        width: 46%;
+        height: 20%;
+        border: 0;
+        border-radius: 999px;
+        background: radial-gradient(circle at 50% 45%, rgba(255, 247, 237, 0.72), rgba(251, 146, 60, 0.18));
+    }
+
+    .food-illustration-bakery .food-illustration-core {
+        left: 20%;
+        right: 18%;
+        bottom: 26%;
+        height: 34%;
+        border-top: 2px solid rgba(253, 230, 138, 0.72);
+        border-radius: 999px 999px 18px 18px;
+    }
+
+    .food-illustration-bakery::after {
+        left: 32%;
+        top: 34%;
+        width: 9%;
+        height: 9%;
+        border: 0;
+        border-radius: 50%;
+        background: rgba(253, 230, 138, 0.72);
+        box-shadow: 16px -2px 0 rgba(253, 230, 138, 0.52), 30px 2px 0 rgba(253, 230, 138, 0.38);
+    }
+
+    .food-illustration-dessert .food-illustration-steam,
+    .food-illustration-bakery .food-illustration-steam {
+        display: none;
+    }
+
+    .food-illustration-cutlery .food-illustration-core {
+        left: 36%;
+        bottom: 18%;
+        width: 2px;
+        height: 54%;
+        border: 0;
+        border-radius: 999px;
+        background: rgba(253, 230, 138, 0.72);
+        box-shadow: 18px 0 0 rgba(253, 230, 138, 0.50);
+    }
+
+    .food-illustration-cutlery::after {
+        left: 56%;
+        top: 18%;
+        width: 18%;
+        height: 36%;
+        border: 2px solid rgba(253, 230, 138, 0.62);
+        border-right: 0;
+        border-bottom: 0;
+        border-radius: 12px 0 0 0;
+        transform: none;
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+        .food-illustration {
+            animation: foodFloat 5.6s ease-in-out infinite;
+        }
+
+        .food-illustration-steam,
+        .food-illustration::after {
+            animation: foodSteam 3.8s ease-in-out infinite;
+        }
+
+        .food-illustration-dessert::after,
+        .food-illustration-bakery::after,
+        .food-illustration-cutlery::after {
+            animation: none !important;
+        }
+    }
+
+    @keyframes foodFloat {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-3px); }
+    }
+
+    @keyframes foodSteam {
+        0%, 100% { opacity: 0.42; transform: translateY(2px) rotate(10deg); }
+        50% { opacity: 0.76; transform: translateY(-4px) rotate(3deg); }
+    }
+
+    @media (max-width: 768px) {
+        .bento-card,
+        .segment-card,
+        .timeline-day,
+        .food-card,
+        .info-card,
+        .warning-card,
+        .budget-card,
+        .weather-card,
+        .checklist-card,
+        .photo-card,
+        .trust-card {
+            padding: 0.92rem !important;
+            min-height: auto !important;
+        }
+
+        .food-card h3,
+        .food-card .food-original-name,
+        .food-card .food-location {
+            padding-right: 4.3rem;
+        }
+
+        .food-illustration {
+            width: 58px;
+            height: 58px;
+            top: 0.78rem;
+            right: 0.78rem;
+            opacity: 0.36;
+        }
+
+        .section-heading {
+            font-size: clamp(1.35rem, 7vw, 1.78rem) !important;
+        }
+
+        .cover-content {
+            max-width: calc(100% - 1.8rem);
+        }
+
+        .cover-content h2 {
+            font-size: clamp(1.75rem, 10vw, 3rem) !important;
+            line-height: 1.12 !important;
+        }
+
+        .slot-meta-grid,
+        .weather-meta {
+            grid-template-columns: minmax(0, 1fr) !important;
+        }
+    }
+
+    /* Mobile card layout fixes: keep summaries, budgets and timeline readable without broad duplicate overrides. */
+    @media (max-width: 768px) {
+        .bento-card {
+            justify-content: center !important;
+            padding: 1.25rem 1.15rem !important;
+            gap: 0.45rem !important;
+        }
+
+        .budget-card {
+            padding: 1.25rem 1.15rem !important;
+        }
+
+        .timeline-slot {
+            grid-template-columns: 56px minmax(0, 1fr) !important;
+            gap: 0.65rem !important;
+        }
+
+        .timeline-slot > div:nth-child(2) {
+            width: 100% !important;
+            min-width: 0 !important;
+            overflow: visible !important;
+            word-break: break-word !important;
+            overflow-wrap: anywhere !important;
+        }
+
+        .slot-icon {
+            width: 44px !important;
+            min-width: 44px !important;
+            height: 44px !important;
+            font-size: 0.82rem !important;
+            line-height: 1.1 !important;
+            white-space: normal !important;
+        }
+
+        .slot-time {
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: unset !important;
+            word-break: keep-all !important;
+            overflow-wrap: anywhere !important;
+            line-height: 1.35 !important;
+        }
+    }
+    @media (max-width: 768px) {
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 0.5rem !important;
+        }
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 0 0 100% !important;
+            min-width: 0 !important;
+            padding: 0 !important;
+        }
+    }
+    @media (max-width: 480px) {
+        .hero.product-hero {
+            padding: 0.85rem !important;
+        }
+    }
+    </style>
+    """
+
+    st.markdown(custom_css, unsafe_allow_html=True)
+
+
+def parse_chinese_number(number_text: str) -> int:
+    """parse_chinese_number：把常见中文数字转换成整数。"""
+
+    # chinese_number_map：保存中文数字到阿拉伯数字的对应关系。
+    chinese_number_map = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+    }
+
+    if number_text.isdigit():
+        return int(number_text)
+
+    if number_text == "十":
+        return 10
+
+    if number_text.startswith("十"):
+        return 10 + chinese_number_map.get(number_text[-1], 0)
+
+    if "十" in number_text:
+        # parts：中文数字按“十”拆分后的十位和个位。
+        parts = number_text.split("十")
+        tens = chinese_number_map.get(parts[0], 1)
+        ones = chinese_number_map.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
+        return tens * 10 + ones
+
+    return chinese_number_map.get(number_text, DEFAULT_TRAVEL_DAYS)
+
+
+def parse_chinese_amount(amount_text: str) -> float | None:
+    """parse_chinese_amount：把中文预算金额转换成数字，例如“一万”转成 10000。"""
+
+    # cleaned_amount：清理空格后的中文金额文本。
+    cleaned_amount = amount_text.strip()
+    if not cleaned_amount:
+        return None
+
+    if re.fullmatch(r"[0-9][0-9,]*(?:\.\d+)?", cleaned_amount):
+        return float(cleaned_amount.replace(",", ""))
+
+    # chinese_digit_map：中文数字字符和数值的对应关系。
+    chinese_digit_map = {
+        "零": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+    }
+
+    if cleaned_amount.endswith("万"):
+        # base_text：中文金额中“万”前面的数字部分。
+        base_text = cleaned_amount[:-1]
+        if not base_text:
+            return 10000.0
+        base_value = parse_chinese_number(base_text)
+        return float(base_value * 10000)
+
+    if cleaned_amount in chinese_digit_map:
+        return float(chinese_digit_map[cleaned_amount])
+
+    if "千" in cleaned_amount:
+        # thousand_parts：中文金额按“千”拆分后的千位和余数。
+        thousand_parts = cleaned_amount.split("千", 1)
+        thousands = parse_chinese_number(thousand_parts[0] or "一") * 1000
+        rest = parse_chinese_amount(thousand_parts[1]) if thousand_parts[1] else 0
+        return float(thousands + (rest or 0))
+
+    return None
+
+
+def normalize_currency_unit(currency_text: str | None) -> str:
+    """normalize_currency_unit：把用户输入的货币单位统一成标准货币代码。"""
+
+    if not currency_text:
+        return DEFAULT_BUDGET_CURRENCY
+
+    # normalized_unit：统一大小写并去除空格后的货币单位。
+    normalized_unit = currency_text.strip().upper()
+
+    # currency_alias_map：常见货币表达和标准货币代码的对应关系。
+    currency_alias_map = {
+        "人民币": "CNY",
+        "RMB": "CNY",
+        "CNY": "CNY",
+        "元": "CNY",
+        "块": "CNY",
+        "日元": "JPY",
+        "日币": "JPY",
+        "日圓": "JPY",
+        "JPY": "JPY",
+        "美元": "USD",
+        "美金": "USD",
+        "USD": "USD",
+        "欧元": "EUR",
+        "欧": "EUR",
+        "EUR": "EUR",
+        "韩元": "KRW",
+        "韩币": "KRW",
+        "KRW": "KRW",
+    }
+
+    return currency_alias_map.get(normalized_unit, DEFAULT_BUDGET_CURRENCY)
+
+
+def get_currency_name(currency_code: str) -> str:
+    """get_currency_name：把标准货币代码转换成中文显示名称。"""
+
+    # currency_name_map：标准货币代码和中文名称的对应关系。
+    currency_name_map = {
+        "CNY": "人民币",
+        "JPY": "日元",
+        "USD": "美元",
+        "EUR": "欧元",
+        "KRW": "韩元",
+    }
+
+    return currency_name_map.get(currency_code, currency_code)
+
+
+def format_budget_amount(amount: float) -> str:
+    """format_budget_amount：把预算金额格式化为适合页面展示的文本。"""
+
+    # numeric_amount：兼容 int 和 float 的预算金额数值。
+    numeric_amount = float(amount)
+
+    if numeric_amount.is_integer():
+        return f"{int(numeric_amount):,}"
+
+    return f"{numeric_amount:,.2f}".rstrip("0").rstrip(".")
+
+
+def parse_budget_info(cleaned_input: str, budget_level: str) -> dict:
+    """parse_budget_info：识别用户输入中的预算金额和货币单位。"""
+
+    # budget_pattern：匹配“预算5000”“预算一万”“预算10万日元”“预算800 USD”等表达。
+    budget_pattern = re.compile(
+        r"(?:预算|总预算|花费|费用)\s*"
+        r"(?:约|大概|大约|控制在|不超过|不超|以内|左右|是|为|:|：)?\s*"
+        r"([0-9][0-9,]*(?:\.\d+)?|[零一二两三四五六七八九十百千万]+)\s*"
+        r"(万)?\s*"
+        r"(人民币|日元|日币|日圓|美元|美金|欧元|欧|韩元|韩币|USD|EUR|JPY|KRW|RMB|CNY|元|块)?",
+        re.IGNORECASE,
+    )
+
+    # budget_match：预算金额匹配结果。
+    budget_match = budget_pattern.search(cleaned_input)
+    if not budget_match:
+        return {
+            "amount": None,
+            "currency": None,
+            "currency_name": None,
+            "display": budget_level,
+            "level": budget_level,
+            "has_explicit_amount": False,
+        }
+
+    # amount_text：预算金额文本。
+    amount_text = budget_match.group(1)
+
+    # amount_value：预算金额数值。
+    amount_value = parse_chinese_amount(amount_text)
+    if amount_value is None:
+        amount_value = float(amount_text.replace(",", ""))
+
+    if budget_match.group(2) and "万" not in amount_text:
+        amount_value *= 10000
+
+    # currency_code：标准货币代码；用户没写单位时默认 CNY。
+    currency_code = normalize_currency_unit(budget_match.group(3))
+
+    # currency_name：中文货币名称。
+    currency_name = get_currency_name(currency_code)
+
+    # budget_display：页面和提示词展示的预算文本。
+    budget_display = f"{format_budget_amount(amount_value)} {currency_name} ({currency_code})"
+
+    # normalized_amount：整数金额保存为 int，便于 Debug 区显示 10000 而不是 10000.0。
+    normalized_amount = int(amount_value) if float(amount_value).is_integer() else amount_value
+
+    return {
+        "amount": normalized_amount,
+        "currency": currency_code,
+        "currency_name": currency_name,
+        "display": budget_display,
+        "level": budget_level,
+        "has_explicit_amount": True,
+    }
+
+
+def infer_destination_currency(destination: str) -> str | None:
+    """infer_destination_currency：根据目的地粗略推断当地常用货币。"""
+
+    # destination_currency_keywords：国外目的地关键词和当地货币代码。
+    destination_currency_keywords = {
+        "JPY": ["日本", "东京", "大阪", "京都", "北海道", "冲绳", "奈良", "福冈", "名古屋", "札幌", "箱根"],
+        "KRW": ["韩国", "首尔", "釜山", "济州"],
+        "EUR": [
+            "欧洲",
+            "法国",
+            "巴黎",
+            "意大利",
+            "罗马",
+            "米兰",
+            "德国",
+            "柏林",
+            "西班牙",
+            "巴塞罗那",
+            "荷兰",
+            "阿姆斯特丹",
+            "葡萄牙",
+            "希腊",
+            "瑞士",
+        ],
+        "USD": ["美国", "纽约", "洛杉矶", "旧金山", "西雅图", "夏威夷"],
+    }
+
+    for currency_code, keyword_list in destination_currency_keywords.items():
+        if any(keyword in destination for keyword in keyword_list):
+            return currency_code
+
+    return None
+
+
+def build_exchange_hint(parsed_request: dict) -> str | None:
+    """build_exchange_hint：为国外目的地生成粗略换算提示。"""
+
+    # budget_amount：用户输入的预算金额。
+    budget_amount = parsed_request.get("budget_amount")
+    if not budget_amount:
+        return None
+
+    # destination_currency：根据目的地推断出的当地货币。
+    destination_currency = infer_destination_currency(parsed_request["destination"])
+    if not destination_currency:
+        return None
+
+    # source_currency：用户输入预算的货币代码。
+    source_currency = parsed_request.get("budget_currency") or DEFAULT_BUDGET_CURRENCY
+
+    # cny_to_currency_rate：人民币到其他货币的粗略换算比例。
+    cny_to_currency_rate = {
+        "JPY": 20.0,
+        "KRW": 190.0,
+        "EUR": 0.13,
+        "USD": 0.14,
+    }
+
+    # currency_to_cny_rate：其他货币到人民币的粗略换算比例。
+    currency_to_cny_rate = {
+        "JPY": 0.05,
+        "KRW": 0.0053,
+        "EUR": 7.8,
+        "USD": 7.2,
+        "CNY": 1.0,
+    }
+
+    if source_currency == DEFAULT_BUDGET_CURRENCY and destination_currency in cny_to_currency_rate:
+        # converted_amount：人民币预算换算成目的地当地货币的粗略金额。
+        converted_amount = budget_amount * cny_to_currency_rate[destination_currency]
+        return (
+            f"粗略换算：{format_budget_amount(budget_amount)} 人民币约 "
+            f"{format_budget_amount(converted_amount)} {get_currency_name(destination_currency)}"
+            "，汇率仅供参考，请以出行前实际汇率为准。"
+        )
+
+    if source_currency != DEFAULT_BUDGET_CURRENCY and source_currency in currency_to_cny_rate:
+        # converted_amount：外币预算换算成人民币的粗略金额。
+        converted_amount = budget_amount * currency_to_cny_rate[source_currency]
+        return (
+            f"粗略换算：{format_budget_amount(budget_amount)} {get_currency_name(source_currency)}约 "
+            f"{format_budget_amount(converted_amount)} 人民币"
+            "，汇率仅供参考，请以出行前实际汇率为准。"
+        )
+
+    return None
+
+
+def extract_destination(cleaned_input: str) -> str:
+    """extract_destination：从用户输入中优先提取明确目的地。"""
+
+    # destination_patterns：从强到弱排列的目的地匹配规则。
+    destination_patterns = [
+        r"(?:^|[，。,\s])([一-龥A-Za-z]{2,20})\s*(?:[0-9一二两三四五六七八九十]+)\s*(?:日游|日旅行|日自由行|天游|天旅行|天自由行)",
+        r"想去(?!看看|看一看|看|尝|尝一尝|吃|逛)([一-龥A-Za-z]{2,20}?)(?:旅游|旅行|自由行|游|度假|玩|看|赏|吃|逛|，|。|,|\s|$)",
+        r"去(?!看看|看一看|看|尝|尝一尝|吃|逛)([一-龥A-Za-z]{2,20}?)(?:旅游|旅行|自由行|游|度假|玩|看|赏|吃|逛|，|。|,|\s|$)",
+        r"(?:^|[，。,\s])([一-龥A-Za-z]{2,20}?)\s*(?:旅游|旅行|自由行|度假|游)",
+        r"目的地[:：]\s*([一-龥A-Za-z]{2,20})",
+    ]
+
+    # invalid_destination_words：不应被当成目的地的动作词或泛词。
+    invalid_destination_words = {
+        "看看",
+        "看一看",
+        "看",
+        "尝",
+        "尝一尝",
+        "美食",
+        "夜景",
+        "其他景点",
+        "景点",
+    }
+
+    for pattern in destination_patterns:
+        match = re.search(pattern, cleaned_input)
+        if not match:
+            continue
+
+        # destination：当前规则识别出的目的地。
+        destination = match.group(1).strip()
+        destination = re.sub(r"^(?:我|我们|本人)?(?:想去|要去|计划去|打算去|去)", "", destination).strip()
+        if destination and destination not in invalid_destination_words:
+            return destination
+
+    return DEFAULT_DESTINATION
+
+
+def extract_trip_days(cleaned_input: str) -> tuple[int, int]:
+    """extract_trip_days：识别“7日游”“7天”“七日”等明确天数。"""
+
+    # days_patterns：可识别的天数表达。
+    days_patterns = [
+        r"([0-9一二两三四五六七八九十]+)\s*(?:日游|日旅行|日自由行|天游|天旅行|天自由行)",
+        r"([0-9一二两三四五六七八九十]+)\s*(?:天|日)(?!元|币)",
+    ]
+
+    for pattern in days_patterns:
+        match = re.search(pattern, cleaned_input)
+        if match:
+            days = max(1, parse_chinese_number(match.group(1)))
+            return days, max(0, days - 1)
+
+    return DEFAULT_TRAVEL_DAYS, DEFAULT_TRAVEL_NIGHTS
+
+
+def get_known_destination_names() -> list[str]:
+    """get_known_destination_names：返回用于多目的地识别的常见目的地名称。"""
+
+    return [
+        "内蒙古",
+        "黑龙江",
+        "张家界",
+        "九寨沟",
+        "西双版纳",
+        "香格里拉",
+        "南京",
+        "江西",
+        "南昌",
+        "景德镇",
+        "婺源",
+        "庐山",
+        "上饶",
+        "赣州",
+        "上海",
+        "苏州",
+        "杭州",
+        "香港",
+        "澳门",
+        "东京",
+        "京都",
+        "大阪",
+        "广州",
+        "深圳",
+        "北京",
+        "成都",
+        "重庆",
+        "西安",
+        "云南",
+        "大理",
+        "丽江",
+        "昆明",
+        "福建",
+        "厦门",
+        "泉州",
+        "福州",
+        "广东",
+        "海南",
+        "三亚",
+        "青岛",
+        "长沙",
+        "武汉",
+        "天津",
+        "首尔",
+        "釜山",
+        "济州",
+        "日本",
+        "韩国",
+        "欧洲",
+        "法国",
+        "巴黎",
+        "意大利",
+        "罗马",
+        "美国",
+        "纽约",
+        "洛杉矶",
+    ]
+
+
+def get_province_route_note(destination: str) -> str:
+    """get_province_route_note：为省份或大区域目的地生成具体城市路线提示。"""
+
+    # province_route_map：省份或大区域到经典城市组合的映射。
+    province_route_map = {
+        "江西": "你输入的是省份，系统为你选择较经典的江西路线：南昌、景德镇、婺源、庐山、上饶，可根据偏好调整。",
+        "云南": "你输入的是省份，系统会优先按昆明、大理、丽江、香格里拉等经典路线规划，可根据偏好调整。",
+        "福建": "你输入的是省份，系统会优先按厦门、泉州、福州或武夷山等经典路线规划，可根据偏好调整。",
+        "广东": "你输入的是省份，系统会优先按广州、深圳、珠海或潮汕等经典路线规划，可根据偏好调整。",
+        "海南": "你输入的是省份，系统会优先按海口、三亚、万宁等经典路线规划，可根据偏好调整。",
+        "日本": "你输入的是国家，系统会优先按东京、京都、大阪等经典路线规划，可根据偏好调整。",
+        "韩国": "你输入的是国家，系统会优先按首尔、釜山、济州等经典路线规划，可根据偏好调整。",
+        "欧洲": "你输入的是大区域，系统会选择适合天数的城市组合，并明确说明推断依据。",
+    }
+
+    return province_route_map.get(destination, "")
+
+
+def clean_destination_candidate(destination_text: str) -> str:
+    """clean_destination_candidate：清理多目的地正则中捕获的目的地候选词。"""
+
+    # cleaned_destination：去掉连接词、动词和标点后的目的地。
+    cleaned_destination = destination_text.strip()
+    cleaned_destination = re.sub(r"^[，。；、,\s+]+", "", cleaned_destination)
+    cleaned_destination = re.sub(
+        r"^(?:然后再去|然后去|接着去|随后去|之后去|先去|再去|然后再|然后|接着|随后|之后|先|再)",
+        "",
+        cleaned_destination,
+    )
+    cleaned_destination = re.sub(r"^(?:去|到|前往|游玩|玩|旅游|旅行|自由行)", "", cleaned_destination)
+    cleaned_destination = re.sub(r"(?:游玩|玩|旅游|旅行|自由行|游)$", "", cleaned_destination)
+    return cleaned_destination.strip(" ，。,.;；、+")
+
+
+def is_valid_destination_candidate(destination_text: str) -> bool:
+    """is_valid_destination_candidate：过滤不应当作为目的地的词。"""
+
+    # invalid_destination_words：动作词、偏好词和泛词，不能当作目的地。
+    invalid_destination_words = {
+        "然后",
+        "然后再",
+        "再去",
+        "喜欢",
+        "历史",
+        "文化",
+        "历史文化",
+        "美食",
+        "夜景",
+        "预算",
+        "交通",
+        "住宿",
+        "餐饮",
+        "景点",
+        "其他景点",
+    }
+
+    if not destination_text or destination_text in invalid_destination_words:
+        return False
+
+    if len(destination_text) < 2 or len(destination_text) > 12:
+        return False
+
+    return bool(re.search(r"[一-龥A-Za-z]", destination_text))
+
+
+def find_known_destination_matches(cleaned_input: str) -> list[dict]:
+    """find_known_destination_matches：在用户输入中查找已知目的地并按位置去重。"""
+
+    # known_destinations：常见目的地词表，按长度降序避免长地名被短词截断。
+    known_destinations = sorted(get_known_destination_names(), key=len, reverse=True)
+
+    # destination_matches：用户输入中出现的目的地及位置。
+    destination_matches = []
+    for destination in known_destinations:
+        for match in re.finditer(re.escape(destination), cleaned_input):
+            destination_matches.append({"destination": destination, "start": match.start(), "end": match.end()})
+
+    destination_matches.sort(key=lambda item: item["start"])
+
+    # deduped_matches：按文本位置去重，避免同一位置重复匹配。
+    deduped_matches = []
+    occupied_ranges = []
+    for item in destination_matches:
+        if any(item["start"] >= start and item["end"] <= end for start, end in occupied_ranges):
+            continue
+        deduped_matches.append(item)
+        occupied_ranges.append((item["start"], item["end"]))
+
+    # unique_matches：同一个目的地多次出现时只保留第一次。
+    unique_matches = []
+    seen_destinations = set()
+    for item in deduped_matches:
+        destination = item["destination"]
+        if destination in seen_destinations:
+            continue
+        unique_matches.append(item)
+        seen_destinations.add(destination)
+
+    return unique_matches
+
+
+def get_weather_reference_city(destination: str, travel_json: dict | None = None) -> tuple[str, str]:
+    """get_weather_reference_city：把省份或大区域目的地转换为适合查询天气的主要城市。"""
+
+    # destination_city_map：省份、国家或大区域到天气参考城市的映射。
+    destination_city_map = {
+        "江西": "南昌",
+        "云南": "昆明",
+        "福建": "厦门",
+        "广东": "广州",
+        "海南": "海口",
+        "日本": "东京",
+        "韩国": "首尔",
+        "欧洲": "巴黎",
+    }
+
+    # city_from_map：从固定映射中得到的参考城市。
+    city_from_map = destination_city_map.get(destination)
+    if city_from_map:
+        return city_from_map, f"{destination}主要城市天气参考：{city_from_map}"
+
+    return destination, destination
+
+
+def geocode_destination(destination: str) -> dict | None:
+    """geocode_destination：使用 Open-Meteo Geocoding API 把目的地转换为经纬度。"""
+
+    if not destination:
+        return None
+
+    # cache_key：地理编码缓存 key，避免同一目的地重复请求 Open-Meteo。
+    cache_key = hashlib.sha256(destination.strip().lower().encode("utf-8")).hexdigest()
+    cached_geocode = get_cached_runtime_value("weather_geocode_cache", cache_key, WEATHER_GEOCODE_CACHE_TTL_SECONDS)
+    if isinstance(cached_geocode, dict):
+        return cached_geocode
+
+    try:
+        # response：Open-Meteo 地理编码接口响应。
+        response = requests.get(
+            OPEN_METEO_GEOCODING_URL,
+            params={
+                "name": destination,
+                "count": 1,
+                "language": "zh",
+                "format": "json",
+            },
+            timeout=8,
+        )
+        response.raise_for_status()
+        # geocode_data：地理编码 JSON 数据。
+        geocode_data = response.json()
+    except Exception:
+        return None
+
+    # result_list：Open-Meteo 返回的候选地点列表。
+    result_list = geocode_data.get("results", [])
+    if not result_list:
+        return None
+
+    # first_result：最匹配的地点。
+    first_result = result_list[0]
+    latitude = first_result.get("latitude")
+    longitude = first_result.get("longitude")
+    if latitude is None or longitude is None:
+        return None
+
+    geocode_result = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "name": first_result.get("name", destination),
+        "country": first_result.get("country", ""),
+        "timezone": first_result.get("timezone", "auto"),
+    }
+    set_cached_runtime_value("weather_geocode_cache", cache_key, geocode_result)
+    return geocode_result
+
+
+def fetch_weather_forecast(latitude: float, longitude: float) -> dict | None:
+    """fetch_weather_forecast：使用 Open-Meteo Forecast API 查询未来天气。"""
+
+    # cache_key：天气结果缓存 key，按经纬度和预报天数区分。
+    cache_key = hashlib.sha256(
+        f"{round(float(latitude), 4)}|{round(float(longitude), 4)}|{WEATHER_FORECAST_DAYS}".encode("utf-8")
+    ).hexdigest()
+    cached_forecast = get_cached_runtime_value("weather_forecast_cache", cache_key, WEATHER_FORECAST_CACHE_TTL_SECONDS)
+    if isinstance(cached_forecast, dict):
+        return cached_forecast
+
+    try:
+        # response：Open-Meteo 天气预报接口响应。
+        response = requests.get(
+            OPEN_METEO_FORECAST_URL,
+            params={
+                "latitude": latitude,
+                "longitude": longitude,
+                "daily": ",".join(
+                    [
+                        "weather_code",
+                        "temperature_2m_max",
+                        "temperature_2m_min",
+                        "precipitation_probability_max",
+                        "wind_speed_10m_max",
+                    ]
+                ),
+                "hourly": "relative_humidity_2m",
+                "timezone": "auto",
+                "forecast_days": WEATHER_FORECAST_DAYS,
+            },
+            timeout=8,
+        )
+        response.raise_for_status()
+        forecast_data = response.json()
+        set_cached_runtime_value("weather_forecast_cache", cache_key, forecast_data)
+        return forecast_data
+    except Exception:
+        return None
+
+
+def map_weather_code(weather_code: int | None) -> tuple[str, str]:
+    """map_weather_code：把 Open-Meteo 天气代码转换成中文天气状态和图标。"""
+
+    if weather_code is None:
+        return "天气待确认", "🌦️"
+
+    # weather_code_map：WMO 天气代码到中文状态的映射。
+    weather_code_map = {
+        0: ("晴", "☀️"),
+        1: ("大致晴朗", "🌤️"),
+        2: ("多云", "🌤️"),
+        3: ("阴", "☁️"),
+        45: ("有雾", "☁️"),
+        48: ("雾凇", "☁️"),
+        51: ("小毛毛雨", "🌧️"),
+        53: ("毛毛雨", "🌧️"),
+        55: ("较强毛毛雨", "🌧️"),
+        56: ("冻毛毛雨", "🌧️"),
+        57: ("强冻毛毛雨", "🌧️"),
+        61: ("小雨", "🌧️"),
+        63: ("中雨", "🌧️"),
+        65: ("大雨", "🌧️"),
+        66: ("冻雨", "🌧️"),
+        67: ("强冻雨", "🌧️"),
+        71: ("小雪", "🌨️"),
+        73: ("中雪", "🌨️"),
+        75: ("大雪", "🌨️"),
+        77: ("雪粒", "🌨️"),
+        80: ("阵雨", "🌧️"),
+        81: ("较强阵雨", "🌧️"),
+        82: ("强阵雨", "🌧️"),
+        85: ("阵雪", "🌨️"),
+        86: ("强阵雪", "🌨️"),
+        95: ("雷雨", "⛈️"),
+        96: ("雷雨伴冰雹", "⛈️"),
+        99: ("强雷雨伴冰雹", "⛈️"),
+    }
+
+    return weather_code_map.get(weather_code, ("天气待确认", "🌦️"))
+
+
+def format_weather_date(date_text: str) -> str:
+    """format_weather_date：把 YYYY-MM-DD 日期转换成中文短日期。"""
+
+    try:
+        # date_value：解析后的日期对象。
+        date_value = datetime.fromisoformat(date_text)
+        return f"{date_value.month}月{date_value.day}日"
+    except ValueError:
+        return date_text
+
+
+def format_weather_value(value: float | int | None, suffix: str) -> str:
+    """format_weather_value：格式化天气数值，缺失时不编造。"""
+
+    if value is None:
+        return "--"
+    if isinstance(value, float):
+        return f"{round(value)}{suffix}"
+    return f"{value}{suffix}"
+
+
+def calculate_daily_humidity(weather_data: dict) -> dict[str, int | None]:
+    """calculate_daily_humidity：从小时级湿度数据计算每天平均湿度。"""
+
+    # hourly_data：Open-Meteo 小时级天气数据。
+    hourly_data = weather_data.get("hourly", {})
+
+    # time_list/humidity_list：小时和相对湿度列表。
+    time_list = hourly_data.get("time", [])
+    humidity_list = hourly_data.get("relative_humidity_2m", [])
+
+    # humidity_bucket：按日期收集的湿度值。
+    humidity_bucket: dict[str, list[float]] = {}
+    for time_text, humidity_value in zip(time_list, humidity_list):
+        if humidity_value is None or not time_text:
+            continue
+        date_key = str(time_text).split("T", 1)[0]
+        humidity_bucket.setdefault(date_key, []).append(float(humidity_value))
+
+    # humidity_by_date：每天平均湿度。
+    humidity_by_date: dict[str, int | None] = {}
+    for date_key, values in humidity_bucket.items():
+        humidity_by_date[date_key] = round(sum(values) / len(values)) if values else None
+
+    return humidity_by_date
+
+
+def build_single_weather_advice(weather_item: dict) -> str:
+    """build_single_weather_advice：根据单日天气生成携带和出行提醒。"""
+
+    # weather_text：中文天气状态。
+    weather_text = str(weather_item.get("weather_text", ""))
+
+    # precipitation_probability：降水概率。
+    precipitation_probability = weather_item.get("precipitation_probability")
+
+    # temperature_max/temperature_min/wind_speed：温度和风速。
+    temperature_max = weather_item.get("temperature_max")
+    temperature_min = weather_item.get("temperature_min")
+    wind_speed = weather_item.get("wind_speed")
+
+    # advice_parts：多条提醒合并后的建议。
+    advice_parts = []
+
+    # rainy_words：用于判断雨天的关键词。
+    rainy_words = ["雨", "小雨", "中雨", "大雨", "阵雨", "雷雨"]
+    is_rainy = precipitation_probability is not None and precipitation_probability >= 50
+    if is_rainy or any(word in weather_text for word in rainy_words):
+        advice_parts.append("可能下雨，建议携带雨伞、防水袋和防滑鞋，户外景点注意地面湿滑。☔")
+
+    if temperature_max is not None and temperature_max >= 30:
+        advice_parts.append("气温偏高，注意防晒、补水，尽量避开中午长时间暴晒。")
+
+    if temperature_min is not None and temperature_min <= 10:
+        advice_parts.append("早晚偏冷，建议带外套，注意昼夜温差。")
+
+    if "晴" in weather_text:
+        advice_parts.append("晴天适合户外游玩，记得准备防晒、墨镜和水。☀️")
+
+    if "多云" in weather_text or "阴" in weather_text:
+        advice_parts.append("适合步行游玩，但天气变化仍建议出门前查看实时天气。")
+
+    if wind_speed is not None and wind_speed >= 38:
+        advice_parts.append("风力偏大，注意保暖，高处观景或乘船行程要留意安全。🌬️")
+
+    if not advice_parts:
+        advice_parts.append("天气信息仅供参考，请出行前查看天气 App。")
+
+    return " ".join(advice_parts)
+
+
+def build_weather_advice(weather_data: dict) -> list[dict]:
+    """build_weather_advice：把 Open-Meteo 天气数据整理成每日天气卡片。"""
+
+    if not isinstance(weather_data, dict):
+        return []
+
+    # daily_data：Open-Meteo 每日天气数据。
+    daily_data = weather_data.get("daily", {})
+    date_list = daily_data.get("time", [])
+    if not date_list:
+        return []
+
+    # humidity_by_date：按日期计算出的平均湿度。
+    humidity_by_date = calculate_daily_humidity(weather_data)
+
+    # weather_items：每日天气卡片数据。
+    weather_items = []
+    for index, date_text in enumerate(date_list[:WEATHER_FORECAST_DAYS]):
+        # weather_code：Open-Meteo WMO 天气代码。
+        weather_code_list = daily_data.get("weather_code", [])
+        weather_code = weather_code_list[index] if index < len(weather_code_list) else None
+        weather_text, weather_icon = map_weather_code(weather_code)
+
+        # temperature_max/min：最高和最低温度。
+        temperature_max_list = daily_data.get("temperature_2m_max", [])
+        temperature_min_list = daily_data.get("temperature_2m_min", [])
+        temperature_max = temperature_max_list[index] if index < len(temperature_max_list) else None
+        temperature_min = temperature_min_list[index] if index < len(temperature_min_list) else None
+
+        # precipitation_probability：最大降水概率。
+        precipitation_list = daily_data.get("precipitation_probability_max", [])
+        precipitation_probability = precipitation_list[index] if index < len(precipitation_list) else None
+
+        # wind_speed：最大风速。
+        wind_speed_list = daily_data.get("wind_speed_10m_max", [])
+        wind_speed = wind_speed_list[index] if index < len(wind_speed_list) else None
+        if wind_speed is not None and wind_speed >= 38:
+            weather_icon = "🌬️"
+            weather_text = f"{weather_text}，风力偏大"
+
+        # weather_item：单日天气展示数据。
+        weather_item = {
+            "date": format_weather_date(str(date_text)),
+            "raw_date": str(date_text),
+            "weather_text": weather_text,
+            "weather_icon": weather_icon,
+            "temperature_max": temperature_max,
+            "temperature_min": temperature_min,
+            "humidity": humidity_by_date.get(str(date_text)),
+            "precipitation_probability": precipitation_probability,
+            "wind_speed": wind_speed,
+            "will_rain": bool(
+                (precipitation_probability is not None and precipitation_probability >= 50)
+                or any(word in weather_text for word in ["雨", "阵雨", "雷雨"])
+            ),
+        }
+        weather_item["advice"] = build_single_weather_advice(weather_item)
+        weather_items.append(weather_item)
+
+    return weather_items
+
+
+def build_weather_cards(parsed_request: dict, travel_json: dict | None = None) -> list[dict]:
+    """build_weather_cards：为单目的地或多目的地构建天气模块卡片数据。"""
+
+    # trip_segments：目的地分段列表。
+    trip_segments = parsed_request.get("trip_segments") or [{"destination": parsed_request["destination"]}]
+
+    # weather_cards：所有目的地天气卡片。
+    weather_cards = []
+    seen_weather_destinations = set()
+    for segment in trip_segments:
+        # destination：当前天气卡片对应的目的地。
+        destination = str(segment.get("destination", "")).strip()
+        if not destination or destination in seen_weather_destinations:
+            continue
+        seen_weather_destinations.add(destination)
+
+        # query_city/display_destination：用于查询天气的城市和页面展示标题。
+        query_city, display_destination = get_weather_reference_city(destination, travel_json)
+
+        # geocode_result：目的地经纬度。
+        geocode_result = geocode_destination(query_city)
+        if not geocode_result:
+            weather_cards.append(
+                {
+                    "destination": display_destination,
+                    "query_city": query_city,
+                    "error": "天气信息暂时无法获取，请出行前查看天气 App。",
+                    "days": [],
+                }
+            )
+            continue
+
+        # forecast_data：Open-Meteo 天气预报数据。
+        forecast_data = fetch_weather_forecast(geocode_result["latitude"], geocode_result["longitude"])
+        if not forecast_data:
+            weather_cards.append(
+                {
+                    "destination": display_destination,
+                    "query_city": query_city,
+                    "error": "天气信息暂时无法获取，请出行前查看天气 App。",
+                    "days": [],
+                }
+            )
+            continue
+
+        # day_weather_items：每日天气卡片数据。
+        day_weather_items = build_weather_advice(forecast_data)
+        if not day_weather_items:
+            weather_cards.append(
+                {
+                    "destination": display_destination,
+                    "query_city": query_city,
+                    "error": "天气信息暂时无法获取，请出行前查看天气 App。",
+                    "days": [],
+                }
+            )
+            continue
+
+        weather_cards.append(
+            {
+                "destination": display_destination,
+                "query_city": query_city,
+                "error": "",
+                "days": day_weather_items,
+            }
+        )
+
+    return weather_cards
+
+
+def build_weather_markdown(weather_cards: list[dict] | None) -> str:
+    """build_weather_markdown：把天气卡片转换成可复制 Markdown。"""
+
+    if not weather_cards:
+        return "## 天气与出行提醒 🌦️\n天气信息暂时无法获取，请出行前查看天气 App。"
+
+    # markdown_lines：天气 Markdown 行。
+    markdown_lines = ["## 天气与出行提醒 🌦️"]
+    for weather_card in weather_cards:
+        destination = str(weather_card.get("destination", "目的地"))
+        markdown_lines.append(f"### {destination}｜未来 {WEATHER_FORECAST_DAYS} 天天气")
+        if weather_card.get("error"):
+            markdown_lines.append(str(weather_card["error"]))
+            continue
+
+        for day_weather in weather_card.get("days", []):
+            will_rain_text = "可能下雨" if day_weather.get("will_rain") else "降雨风险较低"
+            markdown_lines.extend(
+                [
+                    f"#### {day_weather.get('date', '')}",
+                    f"- 天气：{day_weather.get('weather_text', '天气待确认')}",
+                    (
+                        f"- 温度：{format_weather_value(day_weather.get('temperature_min'), '°C')} - "
+                        f"{format_weather_value(day_weather.get('temperature_max'), '°C')}"
+                    ),
+                    f"- 湿度：{format_weather_value(day_weather.get('humidity'), '%')}",
+                    f"- 降水概率：{format_weather_value(day_weather.get('precipitation_probability'), '%')}",
+                    f"- 是否可能下雨：{will_rain_text}",
+                    f"- 建议：{day_weather.get('advice', '天气信息仅供参考，请出行前查看天气 App。')}",
+                ]
+            )
+
+    return "\n".join(markdown_lines)
+
+
+def add_unique_items(item_list: list[str], new_items: list[str]) -> None:
+    """add_unique_items：向清单中追加不重复的非空项目。"""
+
+    # existing_items：当前已存在项目集合。
+    existing_items = set(item_list)
+    for item in new_items:
+        cleaned_item = clean_markdown_text(str(item))
+        if cleaned_item and cleaned_item not in existing_items:
+            item_list.append(cleaned_item)
+            existing_items.add(cleaned_item)
+
+
+def destination_has_keyword(parsed_request: dict, keywords: list[str]) -> bool:
+    """destination_has_keyword：判断目的地列表是否包含指定关键词。"""
+
+    # destination_text：合并后的目的地文本。
+    destination_text = " ".join(parsed_request.get("destinations") or [parsed_request["destination"]])
+    return any(keyword in destination_text for keyword in keywords)
+
+
+def get_weather_flags(weather_cards: list[dict] | None) -> dict:
+    """get_weather_flags：从天气卡片中提取雨、高温、低温等准备清单信号。"""
+
+    # weather_flags：天气相关布尔标记。
+    weather_flags = {"rain": False, "hot": False, "cold": False, "wind": False}
+    for weather_card in weather_cards or []:
+        for day_weather in weather_card.get("days", []):
+            weather_text = str(day_weather.get("weather_text", ""))
+            max_temp = day_weather.get("temperature_max")
+            min_temp = day_weather.get("temperature_min")
+            precipitation = day_weather.get("precipitation_probability")
+            if day_weather.get("will_rain") or (precipitation is not None and precipitation >= 50) or "雨" in weather_text:
+                weather_flags["rain"] = True
+            if max_temp is not None and max_temp >= 30:
+                weather_flags["hot"] = True
+            if min_temp is not None and min_temp <= 10:
+                weather_flags["cold"] = True
+            if "风" in weather_text:
+                weather_flags["wind"] = True
+    return weather_flags
+
+
+def normalize_checklist_data(checklist_data: object) -> dict:
+    """normalize_checklist_data：把模型返回的清单数据整理成固定分组。"""
+
+    # group_keys：清单分组字段和页面标题。
+    group_keys = {
+        "documents": "证件与通行",
+        "payment_and_network": "支付与通信",
+        "weather_and_clothing": "天气与穿搭",
+        "electronics": "电子设备",
+        "medicine_and_emergency": "药品与应急",
+        "photo_preparation": "拍照与出片准备",
+        "pre_departure_checks": "出发前确认事项",
+    }
+
+    # normalized_checklist：固定分组后的清单。
+    normalized_checklist = {key: [] for key in group_keys}
+    if not isinstance(checklist_data, dict):
+        return normalized_checklist
+
+    for group_key in group_keys:
+        raw_items = checklist_data.get(group_key, [])
+        if isinstance(raw_items, str):
+            raw_items = [raw_items]
+        if isinstance(raw_items, list):
+            add_unique_items(normalized_checklist[group_key], [str(item) for item in raw_items])
+
+    return normalized_checklist
+
+
+def build_packing_checklist(parsed_request: dict, weather_cards: list[dict] | None, travel_json: dict | None = None) -> dict:
+    """build_packing_checklist：根据目的地、天气和偏好生成旅行准备清单。"""
+
+    # checklist：优先合并模型返回的清单，再补充确定性规则。
+    checklist = normalize_checklist_data((travel_json or {}).get("packing_checklist"))
+
+    # preferences_text：用户偏好文本。
+    preferences_text = "、".join(parsed_request.get("preferences", []))
+
+    # is_hong_kong/is_cross_border/is_foreign：目的地类型判断。
+    is_hong_kong = destination_has_keyword(parsed_request, ["香港"])
+    is_macao = destination_has_keyword(parsed_request, ["澳门"])
+    is_taiwan = destination_has_keyword(parsed_request, ["台湾"])
+    foreign_keywords = [
+        "日本", "东京", "大阪", "京都", "韩国", "首尔", "济州", "泰国", "曼谷", "新加坡",
+        "马来西亚", "越南", "美国", "欧洲", "法国", "意大利", "英国", "澳大利亚", "冰岛",
+    ]
+    is_foreign = destination_has_keyword(parsed_request, foreign_keywords)
+    is_cross_border = is_hong_kong or is_macao or is_taiwan or is_foreign
+
+    if is_hong_kong:
+        add_unique_items(
+            checklist["documents"],
+            ["港澳通行证", "有效签注", "身份证", "酒店订单截图", "交通订单截图"],
+        )
+        add_unique_items(
+            checklist["payment_and_network"],
+            ["少量港币现金", "八达通 App 或实体卡", "支付宝 / 微信", "境外流量包 / 电话卡 / 漫游"],
+        )
+        add_unique_items(checklist["electronics"], ["英标转换插头，如设备不兼容需准备"])
+    elif is_macao:
+        add_unique_items(
+            checklist["documents"],
+            ["港澳通行证", "有效签注", "身份证", "酒店订单截图", "交通订单截图"],
+        )
+        add_unique_items(checklist["payment_and_network"], ["少量澳门元或港币现金", "境外流量包 / 电话卡 / 漫游"])
+    elif is_taiwan:
+        add_unique_items(checklist["documents"], ["大陆居民往来台湾通行证", "有效签注或入台相关材料", "身份证", "酒店订单截图", "交通订单截图"])
+        add_unique_items(checklist["payment_and_network"], ["少量当地现金", "境外流量包 / 电话卡 / 漫游"])
+    elif is_foreign:
+        add_unique_items(
+            checklist["documents"],
+            ["护照", "签证 / 入境材料", "机票订单截图", "酒店订单截图", "旅行保险信息截图"],
+        )
+        add_unique_items(checklist["payment_and_network"], ["境外流量包 / 电话卡 / 漫游", "少量当地现金", "可境外使用的银行卡"])
+        add_unique_items(checklist["electronics"], ["目的地适用转换插头"])
+    else:
+        add_unique_items(checklist["documents"], ["身份证", "酒店订单截图", "交通订单截图"])
+        add_unique_items(checklist["payment_and_network"], ["支付宝 / 微信", "少量现金备用"])
+
+    # 国内与跨境都会用到的基础物品。
+    add_unique_items(checklist["electronics"], ["充电宝", "手机充电线", "耳机", "常用充电器"])
+    add_unique_items(checklist["medicine_and_emergency"], ["常用药", "创可贴", "纸巾 / 湿巾"])
+    add_unique_items(checklist["weather_and_clothing"], ["舒适步行鞋", "轻便背包"])
+    add_unique_items(checklist["pre_departure_checks"], ["确认酒店入住时间", "确认车票 / 机票 / 船票时间", "提前查看景点预约与开放时间"])
+
+    # weather_flags：根据 Open-Meteo 天气补充清单。
+    weather_flags = get_weather_flags(weather_cards)
+    if weather_flags["rain"]:
+        add_unique_items(checklist["weather_and_clothing"], ["雨伞", "防水袋", "防滑鞋或防滑鞋底", "可快干外套"])
+    if weather_flags["hot"]:
+        add_unique_items(checklist["weather_and_clothing"], ["防晒霜", "墨镜", "遮阳帽", "补水用品"])
+    if weather_flags["cold"]:
+        add_unique_items(checklist["weather_and_clothing"], ["外套", "围巾", "保暖衣物"])
+    if weather_flags["wind"]:
+        add_unique_items(checklist["weather_and_clothing"], ["防风外套", "固定帽子的发夹或帽绳"])
+
+    if "拍照" in preferences_text:
+        add_unique_items(checklist["photo_preparation"], ["备用电源", "手机支架", "小型补光灯", "适合拍照的穿搭", "镜头清洁布"])
+    if "美食" in preferences_text:
+        add_unique_items(checklist["medicine_and_emergency"], ["肠胃药", "消食片", "便携湿巾"])
+        add_unique_items(checklist["pre_departure_checks"], ["热门餐厅预留排队时间"])
+    if "夜景" in preferences_text:
+        add_unique_items(checklist["weather_and_clothing"], ["夜间外套"])
+        add_unique_items(checklist["electronics"], ["满电充电宝"])
+        add_unique_items(checklist["pre_departure_checks"], ["提前确认夜间返程交通"])
+    if is_cross_border:
+        add_unique_items(checklist["pre_departure_checks"], ["出发前检查证件有效期", "把证件和订单截图离线保存"])
+
+    return checklist
+
+
+def build_packing_markdown(checklist: dict) -> str:
+    """build_packing_markdown：把旅行准备清单转换为 Markdown。"""
+
+    # group_labels：清单字段与中文标题。
+    group_labels = {
+        "documents": "证件与通行",
+        "payment_and_network": "支付与通信",
+        "weather_and_clothing": "天气与穿搭",
+        "electronics": "电子设备",
+        "medicine_and_emergency": "药品与应急",
+        "photo_preparation": "拍照与出片准备",
+        "pre_departure_checks": "出发前确认事项",
+    }
+
+    markdown_lines = ["## 旅行准备清单 🧳"]
+    for group_key, group_label in group_labels.items():
+        items = checklist.get(group_key, [])
+        if not items:
+            continue
+        markdown_lines.append(f"### {group_label}")
+        markdown_lines.extend(f"- {item}" for item in items)
+    return "\n".join(markdown_lines)
+
+
+def make_photo_spot(
+    destination: str,
+    name: str,
+    location: str,
+    best_for: str,
+    best_time: str,
+    photo_tip: str,
+    reminder: str,
+) -> dict:
+    """make_photo_spot：创建统一的拍照打卡点数据。"""
+
+    return {
+        "destination": clean_markdown_text(destination),
+        "name": clean_markdown_text(name),
+        "location": clean_markdown_text(location),
+        "best_for": clean_markdown_text(best_for),
+        "best_time": clean_markdown_text(best_time),
+        "photo_tip": clean_markdown_text(photo_tip),
+        "reminder": clean_markdown_text(reminder),
+    }
+
+
+def get_fallback_photo_spots_for_destination(destination: str) -> list[dict]:
+    """get_fallback_photo_spots_for_destination：为常见目的地提供具体拍照打卡点兜底。"""
+
+    # fallback_map：常见目的地拍照点。
+    fallback_map = {
+        "深圳": [
+            make_photo_spot("深圳", "深圳湾公园", "南山区深圳湾沿线", "海边日落、城市天际线、情侣照", "日落前 1 小时到蓝调时刻", "用海岸线做前景，人物放在画面三分之一处。", "傍晚骑行和散步人多，注意避让。"),
+            make_photo_spot("深圳", "欢乐港湾摩天轮", "宝安区欢乐港湾", "摩天轮夜景、城市氛围照", "傍晚亮灯后", "低角度拍摩天轮更有压迫感，可用灯光做背景虚化。", "周末人流较多，建议提前规划返程。"),
+            make_photo_spot("深圳", "海上世界", "南山区蛇口海上世界片区", "夜景、街拍、餐饮氛围照", "晚餐前后到夜间", "利用明华轮和灯光招牌做背景，人物靠近光源。", "夜间商业区人多，注意随身物品。"),
+            make_photo_spot("深圳", "南头古城", "南山区南头古城", "历史街区、城市更新街拍", "上午或傍晚光线柔和时", "多拍门楼、巷子和墙面细节，适合复古穿搭。", "部分巷道较窄，拍照时不要影响通行。"),
+            make_photo_spot("深圳", "华侨城创意文化园", "南山区 OCT-LOFT", "文艺街拍、咖啡店外景", "下午 15:00-17:30", "用红砖墙、店铺橱窗和树影做背景。", "店铺营业时间不一，以现场为准。"),
+        ],
+        "香港": [
+            make_photo_spot("香港", "太平山顶", "香港岛山顶区域", "城市夜景、情侣照、朋友圈封面", "日落前 1 小时到蓝调时刻", "优先拍维港方向，人物放在画面侧边，避免正面大逆光。", "热门时段人多，建议提前安排交通和返程时间。"),
+            make_photo_spot("香港", "坚尼地城海边", "香港岛坚尼地城海旁", "海边街拍、电车与海景", "下午到日落前", "压低机位拍海边栏杆和远处海面，适合清爽穿搭。", "海边风较大，注意发型和随身物。"),
+            make_photo_spot("香港", "中环街市 / 嘉咸街壁画", "香港中环街市与嘉咸街周边", "港风街拍、壁画、城市生活感", "上午或下午避开强烈顶光", "用壁画、扶梯和街巷线条构图，适合广角街拍。", "街道车流和人流多，注意安全。"),
+            make_photo_spot("香港", "尖沙咀星光大道", "九龙尖沙咀维港海滨", "维港夜景、城市剪影", "蓝调时刻到夜间", "人物站在栏杆侧边，背景保留维港灯光。", "幻彩咏香江时段人多，建议提前到位。"),
+            make_photo_spot("香港", "彩虹邨", "九龙黄大仙区彩虹邨", "彩色建筑、几何构图", "上午或下午光线均匀时", "用篮球场和楼体色块做背景，穿纯色衣服更突出。", "居民区拍照请保持安静，不要影响住户。"),
+        ],
+        "南京": [
+            make_photo_spot("南京", "秦淮河夜景", "南京夫子庙秦淮河沿线", "夜景、人像、古风氛围照", "蓝调时刻到夜间", "用桥、灯笼和河面倒影构图，人物侧身更自然。", "夜间人流较多，注意保管随身物品。"),
+            make_photo_spot("南京", "夫子庙", "南京秦淮区夫子庙步行街", "古建筑、灯影、旅行纪念照", "傍晚亮灯后", "避开正中央人群，选择侧面檐角和灯牌做背景。", "节假日拥挤，建议错峰。"),
+            make_photo_spot("南京", "先锋书店五台山店", "南京鼓楼区广州路173号附近", "书店人像、文艺照片", "下午或雨天", "利用书架纵深和暖光拍摄，适合安静构图。", "室内拍照请遵守店内规则。"),
+            make_photo_spot("南京", "明孝陵石象路", "南京玄武区明孝陵景区石象路", "秋色、历史感、长焦人像", "清晨或下午柔光时", "用石像和林荫道做纵深，人物不要站太近镜头。", "需核对景区门票和开放时间。"),
+            make_photo_spot("南京", "老门东", "南京秦淮区老门东历史街区", "老街、砖墙、夜间氛围照", "下午到夜间", "用巷口、砖墙和灯光招牌做背景，适合复古穿搭。", "热门餐饮点附近排队人多。"),
+        ],
+        "江西": [
+            make_photo_spot("江西", "南昌滕王阁", "南昌市东湖区赣江边", "古建筑、江景、城市夜景", "傍晚到亮灯后", "从江边或广场侧面拍楼体，保留天空层次。", "登楼和开放时间请出行前确认。"),
+            make_photo_spot("江西", "景德镇陶溪川", "景德镇珠山区陶溪川文创街区", "文创街拍、陶瓷元素、人像", "下午到夜间亮灯后", "用窑厂建筑、橱窗和市集灯光做背景。", "市集开放时间可能变化。"),
+            make_photo_spot("江西", "婺源篁岭", "上饶市婺源县篁岭景区", "晒秋、徽派建筑、山村风景", "上午光线稳定时", "从高处拍村落层次，人物穿浅色或暖色更出片。", "景区天气和索道信息请提前确认。"),
+            make_photo_spot("江西", "庐山牯岭街", "九江市庐山市牯岭街周边", "山城街景、雾气氛围照", "清晨或傍晚", "利用山雾、街灯和坡道构图，适合胶片感。", "山上温差较大，注意保暖。"),
+            make_photo_spot("江西", "上饶望仙谷", "上饶市广信区望仙谷景区", "峡谷夜景、国风人像", "傍晚到夜间亮灯后", "用灯光栈道和峡谷层次做背景，人物站在侧边。", "景区交通和门票请提前核对。"),
+        ],
+    }
+
+    return list(fallback_map.get(destination, []))
+
+
+def normalize_photo_spots_data(photo_data: object, parsed_request: dict) -> list[dict]:
+    """normalize_photo_spots_data：把模型返回的拍照打卡数据整理成统一列表。"""
+
+    # normalized_spots：标准化后的拍照点。
+    normalized_spots = []
+    if not isinstance(photo_data, list):
+        return normalized_spots
+
+    for group_item in photo_data:
+        if not isinstance(group_item, dict):
+            continue
+        destination = clean_markdown_text(str(group_item.get("destination", "")))
+        spots = group_item.get("spots", [])
+        if not isinstance(spots, list):
+            continue
+        for spot_item in spots:
+            if not isinstance(spot_item, dict):
+                continue
+            name = clean_markdown_text(str(spot_item.get("name", "")))
+            if not name:
+                continue
+            normalized_spots.append(
+                make_photo_spot(
+                    destination or infer_food_destination({"location": spot_item.get("location", ""), "name_cn": name}, parsed_request),
+                    name,
+                    str(spot_item.get("location", "位置请以地图 App 最新结果为准")),
+                    str(spot_item.get("best_for", "旅行纪念照")),
+                    str(spot_item.get("best_time", "光线柔和时段")),
+                    str(spot_item.get("photo_tip", "结合现场光线选择构图。")),
+                    str(spot_item.get("reminder", "拍照时注意安全和现场规则。")),
+                )
+            )
+    return normalized_spots
+
+
+def build_photo_spots(parsed_request: dict, travel_json: dict | None = None) -> list[dict]:
+    """build_photo_spots：根据 JSON 和目的地兜底生成拍照打卡推荐。"""
+
+    # photo_spots：模型返回的拍照点。
+    photo_spots = normalize_photo_spots_data((travel_json or {}).get("photo_spots"), parsed_request)
+    seen_keys = {f"{spot['destination']}|{spot['name']}" for spot in photo_spots}
+
+    for destination in parsed_request.get("destinations") or [parsed_request["destination"]]:
+        current_count = sum(1 for spot in photo_spots if spot.get("destination") == destination)
+        if current_count >= 4:
+            continue
+        for fallback_spot in get_fallback_photo_spots_for_destination(destination):
+            spot_key = f"{fallback_spot['destination']}|{fallback_spot['name']}"
+            if spot_key in seen_keys:
+                continue
+            photo_spots.append(fallback_spot)
+            seen_keys.add(spot_key)
+            current_count += 1
+            if current_count >= 4:
+                break
+
+    return photo_spots
+
+
+def build_photo_spots_markdown(photo_spots: list[dict], parsed_request: dict) -> str:
+    """build_photo_spots_markdown：把拍照打卡点转换为 Markdown。"""
+
+    markdown_lines = ["## 拍照打卡推荐 📸"]
+    destinations = parsed_request.get("destinations") or [parsed_request["destination"]]
+    for destination in destinations:
+        destination_spots = [spot for spot in photo_spots if spot.get("destination") == destination]
+        if not destination_spots:
+            continue
+        markdown_lines.append(f"### {destination}拍照打卡")
+        for spot in destination_spots:
+            markdown_lines.extend(
+                [
+                    f"#### {spot['name']}",
+                    f"- 位置：{spot['location']}",
+                    f"- 适合：{spot['best_for']}",
+                    f"- 最佳时间：{spot['best_time']}",
+                    f"- 拍照建议：{spot['photo_tip']}",
+                    f"- 提醒：{spot['reminder']}",
+                ]
+            )
+    return "\n".join(markdown_lines)
+
+
+def clean_user_facing_markdown(markdown_text: str) -> str:
+    """clean_user_facing_markdown：清理 Markdown 标题中的内部技术提示词。"""
+
+    # cleaned_lines：逐行清理后的 Markdown。
+    cleaned_lines = []
+    for line in str(markdown_text).splitlines():
+        heading_match = re.match(r"^(#{2,6})\s+(.+?)\s*$", line)
+        if heading_match:
+            heading_level = heading_match.group(1)
+            heading_text = clean_user_facing_text(heading_match.group(2))
+            if heading_text:
+                cleaned_lines.append(f"{heading_level} {heading_text}")
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
+
+
+def remove_markdown_sections(markdown_text: str, heading_names: set[str]) -> str:
+    """remove_markdown_sections：移除指定二级标题章节，避免 Markdown 原文重复。"""
+
+    # markdown_lines：原始 Markdown 行。
+    markdown_lines = markdown_text.splitlines()
+
+    # kept_lines：保留下来的 Markdown 行。
+    kept_lines = []
+    skipping = False
+    for line in markdown_lines:
+        # heading_match：匹配二级标题。
+        heading_match = re.match(r"^##\s+(.+?)\s*$", line)
+        if heading_match:
+            heading_text = heading_match.group(1).strip()
+            skipping = heading_text in heading_names
+            if skipping:
+                continue
+        if not skipping:
+            kept_lines.append(line)
+
+    return "\n".join(kept_lines).strip()
+
+
+def append_weather_and_blessing_to_markdown(
+    markdown_text: str,
+    weather_cards: list[dict] | None,
+    generated_at: str,
+    parsed_request: dict | None = None,
+    travel_json: dict | None = None,
+    include_deep_modules: bool = True,
+) -> str:
+    """append_weather_and_blessing_to_markdown：把新增实用模块、天气、更新时间和祝福语追加到 Markdown 末尾。"""
+
+    # cleaned_markdown：移除模型可能生成的旧信息区，避免重复和技术词外露。
+    cleaned_markdown = remove_markdown_sections(
+        clean_user_facing_markdown(markdown_text),
+        {
+            "天气与出行提醒",
+            "天气与出行提醒 🌦️",
+            "旅行准备清单",
+            "旅行准备清单 🧳",
+            "拍照打卡推荐",
+            "拍照打卡推荐 📸",
+            "信息来源与更新时间",
+            "信息与更新时间",
+            "旅行祝福语",
+        },
+    )
+
+    # preparation_markdown：旅行准备清单和拍照打卡 Markdown。
+    preparation_markdown = ""
+    if parsed_request and include_deep_modules:
+        packing_checklist = build_packing_checklist(parsed_request, weather_cards, travel_json)
+        photo_spots = build_photo_spots(parsed_request, travel_json)
+        preparation_markdown = "\n\n".join(
+            [
+                build_packing_markdown(packing_checklist),
+                build_photo_spots_markdown(photo_spots, parsed_request),
+            ]
+        )
+
+    # source_markdown：用户友好的信息与更新时间。
+    source_markdown = "\n".join(
+        [
+            "## 信息与更新时间",
+            "本攻略由 AI 根据你的输入和当前可用信息整理生成。",
+            f"更新时间：{generated_at}",
+            "门票、预约、开放时间、交通政策和天气情况可能变化，请出行前以官方渠道和天气 App 为准。",
+        ]
+    )
+
+    # blessing_markdown：旅行祝福语。
+    blessing_markdown = (
+        "## 旅行祝福语\n"
+        "祝你这次旅行顺利又开心。记得提前确认天气、门票和交通安排，慢慢走、好好看，"
+        "把喜欢的风景都装进记忆里。祝你旅途愉快呀～ 🌿✨🧳"
+    )
+
+    return "\n\n".join(
+        item
+        for item in [cleaned_markdown, preparation_markdown, build_weather_markdown(weather_cards), source_markdown, blessing_markdown]
+        if item
+    ).strip()
+
+
+def extract_days_near_destination(text_after_destination: str) -> int | None:
+    """extract_days_near_destination：在目的地后方的小片段中提取天数。"""
+
+    # day_match：匹配“玩2天”“游玩3天”“4日”等表达。
+    day_match = re.search(
+        r"(?:游玩|玩|旅游|旅行|自由行|游)?\s*([0-9一二两三四五六七八九十]+)\s*(?:天|日)(?!元|币)",
+        text_after_destination,
+    )
+    if not day_match:
+        return None
+
+    return max(1, parse_chinese_number(day_match.group(1)))
+
+
+def build_trip_segment(destination: str, days: int, days_inferred: bool, preferences: list[str]) -> dict:
+    """build_trip_segment：构造单个目的地分段对象。"""
+
+    # note：省份、大区域或默认天数提示。
+    note = get_province_route_note(destination)
+    if days_inferred:
+        inferred_note = f"用户未说明{destination}游玩天数，系统默认按{DEFAULT_TRAVEL_DAYS}天规划。"
+        note = f"{inferred_note} {note}".strip()
+
+    return {
+        "destination": destination,
+        "days": days,
+        "nights": max(0, days - 1),
+        "days_inferred": days_inferred,
+        "preferences": preferences,
+        "note": note,
+    }
+
+
+def parse_multi_destination_input(cleaned_input: str, preferences: list[str]) -> list[dict]:
+    """parse_multi_destination_input：确定性识别多目的地和每段天数。"""
+
+    # known_matches：先用已知目的地词表扫描，支持后续目的地没有写天数的情况。
+    known_matches = find_known_destination_matches(cleaned_input)
+    if len(known_matches) >= 2:
+        # segments：按用户输入顺序构造的多目的地分段。
+        segments = []
+        for index, item in enumerate(known_matches):
+            next_start = known_matches[index + 1]["start"] if index + 1 < len(known_matches) else len(cleaned_input)
+            segment_text = cleaned_input[item["end"] : next_start]
+            days = extract_days_near_destination(segment_text)
+            days_inferred = days is None
+            if days_inferred:
+                days = DEFAULT_TRAVEL_DAYS
+            segments.append(build_trip_segment(item["destination"], days, days_inferred, preferences))
+        return segments
+
+    # destination_day_pattern：兜底识别“目的地 + 天数”表达，支持连续书写如“上海2天苏州1天杭州3天”。
+    destination_day_pattern = re.compile(
+        r"([一-龥A-Za-z]{2,20}?)(?:游玩|玩|旅游|旅行|自由行|游)?\s*"
+        r"([0-9一二两三四五六七八九十]+)\s*(?:天|日)(?!元|币)"
+    )
+
+    # regex_segments：从“目的地+天数”表达中识别出的分段。
+    regex_segments = []
+    seen_destinations = set()
+    for match in destination_day_pattern.finditer(cleaned_input):
+        destination = clean_destination_candidate(match.group(1))
+        if not is_valid_destination_candidate(destination) or destination in seen_destinations:
+            continue
+
+        days = max(1, parse_chinese_number(match.group(2)))
+        regex_segments.append(build_trip_segment(destination, days, False, preferences))
+        seen_destinations.add(destination)
+
+    if len(regex_segments) >= 2:
+        return regex_segments
+
+    return []
+
+
+def extract_trip_segments(cleaned_input: str, preferences: list[str]) -> list[dict]:
+    """extract_trip_segments：识别单目的地或多目的地分段行程。"""
+
+    # multi_destination_segments：确定性多目的地解析结果，优先级最高。
+    multi_destination_segments = parse_multi_destination_input(cleaned_input, preferences)
+    if multi_destination_segments:
+        return multi_destination_segments
+
+    # deduped_matches：已知目的地匹配结果。
+    deduped_matches = find_known_destination_matches(cleaned_input)
+
+    if not deduped_matches:
+        destination = extract_destination(cleaned_input)
+        days, nights = extract_trip_days(cleaned_input)
+        return [build_trip_segment(destination, days, False, preferences)]
+
+    # segments：最终分段行程列表。
+    segments = []
+    for index, item in enumerate(deduped_matches):
+        next_start = deduped_matches[index + 1]["start"] if index + 1 < len(deduped_matches) else len(cleaned_input)
+        segment_text = cleaned_input[item["end"] : next_start]
+        days = extract_days_near_destination(segment_text)
+        days_inferred = days is None
+        if days_inferred:
+            days = DEFAULT_TRAVEL_DAYS
+
+        destination = item["destination"]
+        segments.append(build_trip_segment(destination, days, days_inferred, preferences))
+
+    # 如果只识别出一个目的地，沿用全局天数解析，避免“杭州7日游”被默认覆盖。
+    if len(segments) == 1:
+        days, nights = extract_trip_days(cleaned_input)
+        explicit_days_found = bool(re.search(r"[0-9一二两三四五六七八九十]+\s*(?:日游|日旅行|日自由行|天游|天旅行|天自由行|天|日)", cleaned_input))
+        segments[0]["days"] = days
+        segments[0]["nights"] = nights
+        segments[0]["days_inferred"] = not explicit_days_found
+        if segments[0]["days_inferred"]:
+            inferred_note = f"用户未说明{segments[0]['destination']}游玩天数，系统默认按{DEFAULT_TRAVEL_DAYS}天规划。"
+            segments[0]["note"] = f"{inferred_note} {get_province_route_note(segments[0]['destination'])}".strip()
+
+    return segments
+
+
+def infer_budget_level(cleaned_input: str) -> str:
+    """infer_budget_level：识别用户输入中的预算风格档位。"""
+
+    if re.search(r"穷游|省钱|低预算|便宜|学生党", cleaned_input):
+        return "经济预算"
+
+    if re.search(r"舒适一点|舒适|舒服|品质|高端|豪华|不差钱|预算充足", cleaned_input):
+        return "舒适预算"
+
+    return DEFAULT_BUDGET_LEVEL
+
+
+def extract_preferences(cleaned_input: str) -> list[str]:
+    """extract_preferences：从用户输入中提取旅行偏好、景点和体验主题。"""
+
+    # preference_keywords：可识别的旅行偏好关键词。
+    preference_keywords = [
+        "历史文化",
+        "西湖",
+        "灵隐寺",
+        "美食",
+        "夜景",
+        "自然",
+        "动漫",
+        "购物",
+        "历史",
+        "拍照",
+        "文化",
+        "博物馆",
+        "亲子",
+        "海边",
+        "徒步",
+        "温泉",
+        "咖啡",
+        "艺术",
+    ]
+
+    # preferences：从用户输入中识别出的偏好列表。
+    preferences = []
+    for keyword in preference_keywords:
+        if keyword in {"历史", "文化"} and "历史文化" in preferences:
+            continue
+        if keyword in cleaned_input and keyword not in preferences:
+            preferences.append(keyword)
+
+    if not preferences:
+        preferences = ["美食", "拍照"]
+
+    return preferences
+
+
+def extract_fact_check_spots(parsed_request: dict) -> list[str]:
+    """extract_fact_check_spots：提取需要联网校验门票、预约和开放时间的景点。"""
+
+    # generic_preferences：不适合作为具体景点搜索的泛偏好。
+    generic_preferences = {
+        "美食",
+        "夜景",
+        "自然",
+        "动漫",
+        "购物",
+        "历史",
+        "拍照",
+        "文化",
+        "博物馆",
+        "亲子",
+        "海边",
+        "徒步",
+        "温泉",
+        "咖啡",
+        "艺术",
+    }
+
+    # spot_list：从偏好里筛出的具体景点。
+    spot_list = [item for item in parsed_request["preferences"] if item not in generic_preferences]
+
+    if not spot_list:
+        spot_list = ["主要景点"]
+
+    return spot_list[:4]
+
+
+def build_fact_search_queries(parsed_request: dict) -> list[str]:
+    """build_fact_search_queries：生成省额度的合并搜索查询，避免每个景点单独搜索。"""
+
+    # destination：目的地名称，多目的地时合并为一个省额度查询。
+    destination = " ".join(parsed_request.get("destinations") or [parsed_request["destination"]])
+
+    # spot_list：需要查询的景点列表。
+    spot_list = extract_fact_check_spots(parsed_request)
+
+    # important_spots：用户明确提到的重点景点，最多放入 4 个，避免 query 过长。
+    important_spots = [spot for spot in spot_list if spot != "主要景点"][:4]
+
+    # spot_text：重点景点文本，没有明确景点时使用热门景点兜底。
+    spot_text = " ".join(important_spots) if important_spots else "热门景点"
+
+    # query_list：省额度模式下的合并查询列表；默认只会执行第一条。
+    query_list = [
+        f"{destination} {spot_text} 旅游 景点 门票 预约 开放时间 最新 交通 政策",
+        f"{destination} 官方 旅游 景区规则 门票 预约 开放时间 最新政策",
+    ]
+
+    return query_list
+
+
+def get_tavily_api_key() -> str | None:
+    """get_tavily_api_key：读取 Tavily API Key，并忽略示例占位值。"""
+
+    # tavily_api_key：从 .env、环境变量或 Streamlit secrets 读取的 Tavily API Key。
+    tavily_api_key = get_config_value("TAVILY_API_KEY", "").strip()
+    if not tavily_api_key or tavily_api_key.startswith("tvly-your"):
+        return None
+
+    return tavily_api_key
+
+
+def get_deepseek_api_key() -> str | None:
+    """get_deepseek_api_key：读取 DeepSeek API Key，并忽略示例占位值。"""
+
+    # deepseek_api_key：从 .env、环境变量或 Streamlit secrets 读取的 DeepSeek API Key。
+    deepseek_api_key = get_config_value("DEEPSEEK_API_KEY", "").strip()
+    if not deepseek_api_key or deepseek_api_key.startswith("sk-your"):
+        return None
+
+    return deepseek_api_key
+
+
+def get_deepseek_model_name() -> str:
+    """get_deepseek_model_name：读取 DeepSeek 模型名，未配置时使用默认模型。"""
+
+    return get_config_value("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
+
+
+def get_tavily_search_depth() -> str:
+    """get_tavily_search_depth：读取 Tavily 搜索深度，并强制使用 basic 省额度模式。"""
+
+    # configured_depth：用户配置的搜索深度；为省额度，任何非 basic 配置都会被降级为 basic。
+    configured_depth = get_config_value("TAVILY_SEARCH_DEPTH", DEFAULT_TAVILY_SEARCH_DEPTH).strip().lower()
+    return DEFAULT_TAVILY_SEARCH_DEPTH if configured_depth != DEFAULT_TAVILY_SEARCH_DEPTH else configured_depth
+
+
+def get_tavily_max_searches_per_guide() -> int:
+    """get_tavily_max_searches_per_guide：读取每份攻略最多搜索次数，并默认限制为 1 次。"""
+
+    # configured_limit：用户配置的每份攻略最大 Tavily 调用次数。
+    configured_limit = get_int_config("TAVILY_MAX_SEARCHES_PER_GUIDE", DEFAULT_TAVILY_MAX_SEARCHES_PER_GUIDE)
+    return max(0, min(configured_limit, DEFAULT_TAVILY_MAX_SEARCHES_PER_GUIDE))
+
+
+def normalize_tavily_query(destination: str, query: str) -> str:
+    """normalize_tavily_query：把目的地和 query 标准化，用于判断相似搜索并命中缓存。"""
+
+    # token_list：从 query 中提取的中英文关键词。
+    token_list = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", query.lower())
+
+    # normalized_tokens：去重排序后的关键词，使词序轻微变化时仍可复用缓存。
+    normalized_tokens = sorted(set(token_list))
+
+    return f"{destination.strip().lower()}|{'|'.join(normalized_tokens)}"
+
+
+def build_tavily_cache_key(destination: str, query: str) -> str:
+    """build_tavily_cache_key：为目的地和相似 query 生成稳定缓存 key。"""
+
+    # normalized_query：标准化后的 query 文本。
+    normalized_query = normalize_tavily_query(destination, query)
+    return hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()
+
+
+def load_tavily_cache() -> dict:
+    """load_tavily_cache：读取本地 Tavily 缓存文件。"""
+
+    if not TAVILY_CACHE_PATH.exists():
+        return {}
+
+    try:
+        with TAVILY_CACHE_PATH.open("r", encoding="utf-8") as cache_file:
+            return json.load(cache_file)
+    except Exception:
+        return {}
+
+
+def save_tavily_cache(cache_data: dict) -> None:
+    """save_tavily_cache：把 Tavily 搜索结果写入本地缓存文件。"""
+
+    with TAVILY_CACHE_PATH.open("w", encoding="utf-8") as cache_file:
+        json.dump(cache_data, cache_file, ensure_ascii=False, indent=2)
+
+
+def get_cached_tavily_results(destination: str, query: str) -> list[dict] | None:
+    """get_cached_tavily_results：读取 12 小时内的 Tavily 缓存结果。"""
+
+    # cache_data：本地缓存文件中的全部数据。
+    cache_data = load_tavily_cache()
+
+    # cache_key：当前目的地和 query 对应的缓存 key。
+    cache_key = build_tavily_cache_key(destination, query)
+
+    # cached_item：缓存中的单条搜索记录。
+    cached_item = cache_data.get(cache_key)
+    if not cached_item:
+        return None
+
+    # cached_at：缓存写入时间戳。
+    cached_at = float(cached_item.get("cached_at", 0))
+    if time.time() - cached_at > TAVILY_CACHE_TTL_SECONDS:
+        return None
+
+    return cached_item.get("results", [])
+
+
+def set_cached_tavily_results(destination: str, query: str, results: list[dict]) -> None:
+    """set_cached_tavily_results：缓存 Tavily 搜索结果，减少重复搜索消耗。"""
+
+    # cache_data：本地缓存文件中的全部数据。
+    cache_data = load_tavily_cache()
+
+    # cache_key：当前目的地和 query 对应的缓存 key。
+    cache_key = build_tavily_cache_key(destination, query)
+    cache_data[cache_key] = {
+        "destination": destination,
+        "query": query,
+        "cached_at": time.time(),
+        "cached_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "results": results,
+    }
+    save_tavily_cache(cache_data)
+
+
+def is_tavily_limit_error(error: Exception) -> bool:
+    """is_tavily_limit_error：判断 Tavily 错误是否属于额度不足或请求受限。"""
+
+    # error_text：错误文本，兼容 SDK 返回的不同异常格式。
+    error_text = str(error).lower()
+    limit_keywords = ["429", "quota", "rate limit", "ratelimit", "credits", "credit", "insufficient"]
+    return any(keyword in error_text for keyword in limit_keywords)
+
+
+def call_tavily_search(query: str, parsed_request: dict) -> tuple[list[dict], bool]:
+    """call_tavily_search：调用 Tavily SDK 搜索，返回结果和是否命中缓存。"""
+
+    # destination：目的地名称，用于缓存 key。
+    destination = parsed_request["destination"]
+
+    # cached_results：12 小时内缓存命中的搜索结果。
+    cached_results = get_cached_tavily_results(destination, query)
+    if cached_results is not None:
+        return cached_results, True
+
+    # tavily_api_key：Tavily API Key，从 .env、环境变量或 Streamlit secrets 读取。
+    tavily_api_key = get_tavily_api_key()
+    if not tavily_api_key or TavilyClient is None:
+        return [], False
+
+    # tavily_client：Tavily Python SDK 客户端。
+    tavily_client = TavilyClient(api_key=tavily_api_key)
+
+    # response_data：Tavily SDK 搜索返回结果；不启用 answer/raw/images/auto_parameters，控制额度消耗。
+    response_data = tavily_client.search(
+        query=query,
+        search_depth=get_tavily_search_depth(),
+        max_results=DEFAULT_SEARCH_MAX_RESULTS,
+        include_answer=False,
+        include_raw_content=False,
+        include_images=False,
+        auto_parameters=False,
+        timeout=12,
+    )
+
+    # results：Tavily 搜索结果列表。
+    results = response_data.get("results", [])
+    set_cached_tavily_results(destination, query, results)
+    return results, False
+
+
+def build_facts_context(parsed_request: dict) -> tuple[str, list[dict], str | None]:
+    """build_facts_context：联网搜索并整理 facts_context，供 DeepSeek 生成攻略时引用。"""
+
+    # searched_at：事实校验执行时间。
+    searched_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    if not get_bool_config("USE_TAVILY", True):
+        facts_context = f"""
+联网事实校验状态：未启用
+生成模式：普通生成模式，仅使用 DeepSeek 生成攻略
+原因：USE_TAVILY=false
+更新时间：{searched_at}
+页面提示：当前未启用联网搜索，门票、预约、开放时间等信息请出行前二次确认。
+""".strip()
+        return facts_context, [], "未启用联网搜索"
+
+    if TavilyClient is None:
+        facts_context = f"""
+联网事实校验状态：执行失败
+生成模式：普通生成模式，仅使用 DeepSeek 生成攻略
+原因：未安装 tavily-python
+更新时间：{searched_at}
+页面提示：联网搜索失败，已切换普通模式。
+""".strip()
+        return facts_context, [], "联网搜索失败，已切换普通模式"
+
+    # tavily_api_key：Tavily API Key，用于判断是否启用搜索。
+    tavily_api_key = get_tavily_api_key()
+    if not tavily_api_key:
+        facts_context = f"""
+联网事实校验状态：未配置
+生成模式：普通生成模式，仅使用 DeepSeek 生成攻略
+原因：未配置 TAVILY_API_KEY
+更新时间：{searched_at}
+页面提示：未配置 Tavily，当前为普通生成模式。
+""".strip()
+        return facts_context, [], "未配置 Tavily，当前为普通生成模式"
+
+    # max_searches：每份攻略最多 Tavily 调用次数，默认限制为 1 次。
+    max_searches = get_tavily_max_searches_per_guide()
+    if max_searches <= 0:
+        facts_context = f"""
+联网事实校验状态：未启用
+生成模式：普通生成模式，仅使用 DeepSeek 生成攻略
+原因：TAVILY_MAX_SEARCHES_PER_GUIDE=0
+更新时间：{searched_at}
+页面提示：当前未启用联网搜索，门票、预约、开放时间等信息请出行前二次确认。
+""".strip()
+        return facts_context, [], "未启用联网搜索"
+
+    # query_list：本次事实校验需要执行的搜索查询。
+    query_list = build_fact_search_queries(parsed_request)[:max_searches]
+
+    # source_records：用于展示和传给模型的搜索结果。
+    source_records = []
+
+    # used_cache：本次搜索是否命中过本地缓存。
+    used_cache = False
+
+    # context_blocks：facts_context 中的文本块。
+    context_blocks = [
+        "联网事实校验状态：已执行",
+        f"更新时间：{searched_at}",
+        f"搜索模式：Tavily basic，省额度模式，每份攻略最多 {max_searches} 次搜索。",
+        "使用范围：门票、预约规则、开放时间、交通政策等易变化信息只能基于以下搜索结果整理。",
+        "注意：根据搜索结果整理，仍需出行前二次确认。",
+    ]
+
+    try:
+        for query in query_list:
+            # results：单个 query 的网页搜索结果。
+            results, cache_hit = call_tavily_search(query, parsed_request)
+            used_cache = used_cache or cache_hit
+            context_blocks.append(f"\n### 搜索查询：{query}")
+            context_blocks.append(f"- 结果来源：{'本地 24 小时缓存' if cache_hit else 'Tavily basic 搜索'}")
+
+            if not results:
+                context_blocks.append("- 未查到可用结果。")
+                continue
+
+            for result in results:
+                # title：搜索结果标题。
+                title = result.get("title", "未命名来源")
+
+                # url：搜索结果链接。
+                url = result.get("url", "")
+
+                # content：搜索结果摘要内容。
+                content = result.get("content", "") or result.get("snippet", "")
+                content = re.sub(r"\s+", " ", content).strip()
+
+                source_records.append({"query": query, "title": title, "url": url, "content": content})
+                context_blocks.append(f"- 标题：{title}\n  链接：{url}\n  摘要：{content[:360]}")
+    except Exception as error:
+        if is_tavily_limit_error(error):
+            facts_context = f"""
+联网事实校验状态：额度不足
+生成模式：普通生成模式，仅使用 DeepSeek 生成攻略
+更新时间：{searched_at}
+错误：{error}
+要求：门票、预约、开放时间、交通政策等易变化信息不可编造；请写“建议出行前二次确认”。
+""".strip()
+            return facts_context, source_records, "Tavily 额度不足，已切换普通模式"
+
+        facts_context = f"""
+联网事实校验状态：执行失败
+生成模式：普通生成模式，仅使用 DeepSeek 生成攻略
+更新时间：{searched_at}
+错误：{error}
+要求：门票、预约、开放时间、交通政策等易变化信息不可编造；如果 facts_context 没有查到，请写“建议出行前再次核对”。
+""".strip()
+        return facts_context, source_records, "联网搜索失败，已切换普通模式"
+
+    if not source_records:
+        context_blocks.append("\n结论：未查到足够搜索结果。不要编造门票、预约、开放时间，请提示建议出行前再次核对。")
+
+    if used_cache:
+        context_blocks[0] = "联网事实校验状态：缓存命中"
+        return "\n".join(context_blocks), source_records, "使用缓存搜索结果"
+
+    return "\n".join(context_blocks), source_records, "已启用联网搜索"
+
+
+def parse_travel_request(user_input: str) -> dict:
+    """parse_travel_request：从用户的一句话里提取目的地、天数、预算和偏好。"""
+
+    # cleaned_input：去掉多余空格后的用户输入。
+    cleaned_input = user_input.strip()
+
+    # budget_level：识别到的预算档位。
+    budget_level = infer_budget_level(cleaned_input)
+
+    # budget_info：识别到的预算金额、货币单位和展示文本。
+    budget_info = parse_budget_info(cleaned_input, budget_level)
+
+    # preferences：从用户输入中识别出的偏好列表。
+    preferences = extract_preferences(cleaned_input)
+
+    # trip_segments：单目的地或多目的地分段行程。
+    trip_segments = extract_trip_segments(cleaned_input, preferences)
+
+    # destination_list：所有识别到的目的地。
+    destination_list = [segment["destination"] for segment in trip_segments]
+
+    # destination：用于页面总览展示的目的地文本。
+    destination = " × ".join(destination_list) if len(destination_list) > 1 else destination_list[0]
+
+    # days：总旅行天数，多目的地时为各段天数之和。
+    days = sum(segment["days"] for segment in trip_segments)
+
+    # nights：总住宿晚数，按连续旅行粗略估算。
+    nights = max(0, days - 1)
+
+    # nights_match：如果用户明确写了总住宿晚数，则尊重用户输入。
+    nights_match = re.search(r"([0-9一二两三四五六七八九十]+)\s*晚", cleaned_input)
+    if nights_match:
+        nights = max(0, parse_chinese_number(nights_match.group(1)))
+
+    # trip_type：单目的地或多目的地。
+    trip_type = "multi_destination" if len(trip_segments) > 1 else "single_destination"
+
+    # trip_notes：多目的地或省份默认推断提示。
+    trip_notes = [segment["note"] for segment in trip_segments if segment.get("note")]
+
+    # parsed_request：最终返回给页面和大模型的结构化旅行需求。
+    parsed_request = {
+        "trip_type": trip_type,
+        "destination": destination,
+        "destinations": destination_list,
+        "trip_segments": trip_segments,
+        "trip_notes": trip_notes,
+        "days": days,
+        "nights": nights,
+        "total_days": days,
+        "total_nights": nights,
+        "budget": budget_info["display"],
+        "budget_level": budget_info["level"],
+        "style": budget_info["level"].replace("预算", ""),
+        "budget_amount": budget_info["amount"],
+        "budget_currency": budget_info["currency"],
+        "currency": budget_info["currency"],
+        "budget_currency_name": budget_info["currency_name"],
+        "budget_has_explicit_amount": budget_info["has_explicit_amount"],
+        "preferences": preferences,
+    }
+
+    # budget_exchange_hint：国外目的地的粗略换算提示。
+    parsed_request["budget_exchange_hint"] = build_exchange_hint(parsed_request)
+
+    return parsed_request
+
+
+def build_structured_json_prompt(
+    user_input: str,
+    parsed_request: dict,
+    facts_context: str,
+    generation_mode: str = GENERATION_MODE_FAST,
+) -> str:
+    """build_structured_json_prompt：生成结构化旅行 JSON 的 DeepSeek 提示词。"""
+
+    # preferences_json：用户偏好 JSON 文本，确保用户输入优先。
+    preferences_json = json.dumps(parsed_request["preferences"], ensure_ascii=False)
+
+    # trip_segments_json：分段目的地 JSON 文本，确保多目的地不被忽略。
+    trip_segments_json = json.dumps(parsed_request.get("trip_segments", []), ensure_ascii=False, indent=2)
+
+    # search_enabled：是否有可用于事实校验的 Tavily 搜索结果。
+    search_enabled = "联网事实校验状态：已执行" in facts_context or "联网事实校验状态：缓存命中" in facts_context
+
+    # food_rule_text：美食推荐强约束，避免生成泛泛占位卡片。
+    food_rule_text = """
+美食推荐必须是当地美食推荐榜，而不是根据每日行程插入的临时餐饮建议。
+每个目的地至少推荐 4 个具体美食店、餐厅、美食街或小吃区域；多目的地必须分目的地覆盖。
+如果目的地是省份或大区域，必须按攻略路线中的具体城市或区域推荐，例如南昌、景德镇、婺源、庐山、上饶。
+每个美食推荐必须提供具体地址或可地图搜索的明确区域，不能只写当日行程附近。
+必须写推荐菜或推荐吃什么。
+禁止输出“建议结合当日行程区域确认”“适合插入当日行程”“适合穿插在当日行程中”“本地代表料理”“预约型餐厅”“甜品或咖啡”等泛泛占位内容。
+""".strip()
+
+    # fact_rule_text：联网事实约束文本。
+    fact_rule_text = (
+        "门票、预约、开放时间、景区政策、交通政策必须优先依据 facts_context；如果 facts_context 没有明确说明，不要编造，写“建议出行前二次确认”。"
+        if search_enabled
+        else "当前未启用联网搜索，不能编造最新门票、预约、开放时间、景区政策或交通政策；必须写“具体信息请出行前以官方渠道为准”或“建议出行前二次确认”。"
+    )
+
+    # is_fast_mode：快速版减少结构化输出长度，不默认生成清单和拍照点。
+    is_fast_mode = generation_mode == GENERATION_MODE_FAST
+
+    # mode_rule_text：当前生成模式对模型输出长度和模块的约束。
+    mode_rule_text = (
+        "当前生成模式：快速版。请优先生成核心攻略数据，内容简洁；每个时间段 reason/transport/booking_note 控制在 2-3 句话内。"
+        if is_fast_mode
+        else "当前生成模式：深度版。请生成完整攻略数据，包含旅行准备清单和拍照打卡推荐。"
+    )
+
+    # top_level_rule_text：JSON 顶层字段要求。
+    top_level_rule_text = (
+        "trip_type, destination, destinations, total_days, days, nights, budget, preferences, trip_segments, daily_itinerary, food_recommendations；packing_checklist 和 photo_spots 可省略或返回空对象/空数组"
+        if is_fast_mode
+        else "trip_type, destination, destinations, total_days, days, nights, budget, preferences, trip_segments, daily_itinerary, food_recommendations, packing_checklist, photo_spots"
+    )
+
+    # optional_module_schema_text：深度模块 schema 说明。
+    optional_module_schema_text = (
+        """
+快速版不默认生成 packing_checklist 和 photo_spots；如返回，请保持为空对象或空数组，不要展开长内容。
+""".strip()
+        if is_fast_mode
+        else """
+packing_checklist 必须包含：
+documents, payment_and_network, weather_and_clothing, electronics, medicine_and_emergency, photo_preparation, pre_departure_checks
+
+photo_spots 必须是数组。每个对象包含 destination 和 spots。
+spots 每项必须包含：
+name, location, best_for, best_time, photo_tip, reminder
+""".strip()
+    )
+
+    # deep_module_rule_text：旅行清单和拍照打卡规则，快速版不展开。
+    deep_module_rule_text = (
+        """
+16. 快速版不默认生成“旅行准备清单”和“拍照打卡推荐”，packing_checklist/photo_spots 请省略或返回空。
+17. 快速版仍必须保证 daily_itinerary、food_recommendations 和 budget 具体可用。
+18. 快速版每个目的地美食推荐 4 个即可，不要生成长篇报告。
+""".strip()
+        if is_fast_mode
+        else """
+16. 必须生成“旅行准备清单”模块，清单要根据目的地、天气、跨境情况和旅行偏好动态生成，不要写“根据实际情况准备”“带好随身物品”等空话。
+17. 如果用户去香港、澳门、台湾或国外，packing_checklist.documents 必须提醒证件和入境/通行相关材料。香港必须包含港澳通行证、有效签注、身份证、酒店订单截图、交通订单截图；payment_and_network 必须包含少量港币现金、八达通 App 或实体卡、境外流量包 / 电话卡 / 漫游。
+18. 如果天气可能下雨，weather_and_clothing 必须加入雨伞、防水袋、防滑鞋；如果高温，加入防晒霜、墨镜、帽子、补水用品；如果低温，加入外套和保暖衣物。
+19. 如果偏好包含拍照，photo_preparation 必须加入备用电源、手机支架、小型补光灯、适合拍照的穿搭；如果偏好包含美食，medicine_and_emergency 必须加入肠胃药、湿巾；如果偏好包含夜景，pre_departure_checks 必须提醒夜间交通确认。
+20. 必须生成“拍照打卡推荐”模块。每个目的地至少给 4 个具体打卡点；多目的地必须按目的地分组；每个点必须有具体位置或区域、适合拍什么、最佳时间、拍照建议和注意事项。
+21. 拍照打卡必须结合偏好：夜景强化夜景点，历史文化强化老街/古建筑/博物馆外景，美食强化美食街/夜市，拍照强化出片机位。禁止写“选择适合拍照的地方”这类空泛内容。
+""".strip()
+    )
+
+    return f"""
+用户原始需求：
+{user_input}
+
+联网事实校验 facts_context：
+{facts_context}
+
+系统已识别参数，必须严格使用，不能被模型猜测或默认值覆盖：
+- destination: {parsed_request["destination"]}
+- trip_type: {parsed_request.get("trip_type", "single_destination")}
+- destinations: {json.dumps(parsed_request.get("destinations", [parsed_request["destination"]]), ensure_ascii=False)}
+- trip_segments: {trip_segments_json}
+- days: {parsed_request["days"]}
+- nights: {parsed_request["nights"]}
+- budget_amount: {parsed_request.get("budget_amount")}
+- currency: {parsed_request.get("budget_currency") or "CNY"}
+- budget_level: {parsed_request.get("style") or parsed_request.get("budget_level")}
+- preferences: {preferences_json}
+
+请只返回合法 JSON，不要输出 Markdown，不要解释，不要使用代码块。
+{mode_rule_text}
+    JSON 顶层必须包含：
+    {top_level_rule_text}
+
+budget 必须包含：
+amount, currency, level
+
+trip_segments 必须和系统识别参数一致。
+每个 trip_segments 对象必须包含：
+destination, days, nights, days_inferred, theme, note
+
+daily_itinerary 必须 exactly {parsed_request["days"]} 天，从 day 1 到 day {parsed_request["days"]}。
+每天必须包含：
+day, segment_destination, theme, morning, noon, afternoon, evening
+
+morning/noon/afternoon/evening 每个对象必须包含以下非空字段：
+time, place, original_name, reason, duration, transport, booking_note
+
+    food_recommendations 必须包含每个目的地至少 4 家店、餐厅、美食街或具体小吃区域。
+    每个美食推荐对象必须包含以下非空字段：
+    destination, name_cn, name_original, location, recommended_dishes, reason, budget, booking_note, map_keyword
+
+{optional_module_schema_text}
+
+写作规则：
+1. 用户明确提到的景点和偏好必须优先安排：{preferences_json}。
+2. 用户明确提到的所有目的地必须出现在 trip_segments 和 daily_itinerary 中，不允许只生成第一个目的地。
+3. 用户明确输入的所有目的地必须完整出现在攻略中。不得只生成第一个目的地。对于多目的地输入，必须按 trip_segments 分段规划，并保证每日行程覆盖全部目的地。
+4. 如果 days_inferred=true，必须在 note 中说明“用户未说明该目的地天数，系统默认按3天规划”。
+5. 如果目的地是省份、国家或大区域，不要泛泛写省名/国家名；必须推荐具体城市路线，并在 note 中说明推断依据。
+6. 多目的地 daily_itinerary 的 day 必须全程连续编号，不能每段都从 Day 1 重新开始。
+7. 每一天主题必须不同，不能重复。
+8. 同一景点、同一餐厅、同一区域不要重复安排。
+9. 不要使用“核心街区”“本地风味餐厅”“主题体验”“夜景与晚餐区域”等空泛词。
+10. place 必须是具体地点，original_name 必须包含中文名和英文/原名；没有英文名时写中文原名。
+11. reason、transport、booking_note 必须具体，不能空泛。
+    12. {food_rule_text}
+    13. 美食推荐如果是国外目的地，name_original 必须尽量保留英文名、当地语言原名或常用地图搜索名。
+    14. 如果无法确认完整门牌号，不要编造；location 至少写明确区域，例如“香港中环歌赋街”“南京夫子庙附近”“南昌万寿宫历史文化街区”，并用 map_keyword 给出可搜索关键词。
+    15. map_keyword 必须适合复制到 Google Maps / Apple Maps / 百度地图 / 高德地图搜索。
+{deep_module_rule_text}
+    22. {fact_rule_text}
+""".strip()
+
+
+def extract_json_text(model_output: str) -> str:
+    """extract_json_text：从模型输出中提取 JSON 文本，兼容代码块和前后解释。"""
+
+    # fenced_match：匹配 ```json 代码块中的 JSON。
+    fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", model_output, flags=re.IGNORECASE)
+    if fenced_match:
+        return fenced_match.group(1).strip()
+
+    # start_index/end_index：提取第一个对象到最后一个对象之间的内容。
+    start_index = model_output.find("{")
+    end_index = model_output.rfind("}")
+    if start_index >= 0 and end_index > start_index:
+        return model_output[start_index : end_index + 1].strip()
+
+    return model_output.strip()
+
+
+def parse_structured_json_output(model_output: str | None) -> tuple[dict | None, list[str]]:
+    """parse_structured_json_output：把模型原始输出解析为 JSON 对象。"""
+
+    if not model_output:
+        return None, ["模型没有返回 JSON 内容。"]
+
+    # json_text：提取后的 JSON 文本。
+    json_text = extract_json_text(model_output)
+    try:
+        # parsed_json：解析后的 JSON 对象。
+        parsed_json = json.loads(json_text)
+    except json.JSONDecodeError as error:
+        return None, [f"JSON 解析失败：{error}"]
+
+    if not isinstance(parsed_json, dict):
+        return None, ["JSON 顶层必须是对象。"]
+
+    return parsed_json, []
+
+
+def validate_structured_travel_json(travel_json: dict | None, parsed_request: dict) -> list[str]:
+    """validate_structured_travel_json：校验每日行程 JSON 是否完整、准确、不重复。"""
+
+    if not isinstance(travel_json, dict):
+        return ["结构化结果不是 JSON 对象。"]
+
+    # validation_errors：JSON 校验错误列表。
+    validation_errors = []
+
+    # expected_days：用户明确要求或系统识别出的旅行天数。
+    expected_days = parsed_request["days"]
+
+    if travel_json.get("destination") != parsed_request["destination"]:
+        validation_errors.append(f"destination 不一致，应为 {parsed_request['destination']}。")
+
+    if travel_json.get("days") != expected_days:
+        validation_errors.append(f"days 不一致，应为 {expected_days}。")
+
+    if travel_json.get("total_days") is not None and travel_json.get("total_days") != expected_days:
+        validation_errors.append(f"total_days 不一致，应为 {expected_days}。")
+
+    if travel_json.get("nights") != parsed_request["nights"]:
+        validation_errors.append(f"nights 不一致，应为 {parsed_request['nights']}。")
+
+    # expected_destinations：系统识别出的所有目的地。
+    expected_destinations = parsed_request.get("destinations") or [parsed_request["destination"]]
+
+    # destination_json：模型返回的目的地数组。
+    destination_json = travel_json.get("destinations")
+    if isinstance(destination_json, list):
+        missing_destinations = [destination for destination in expected_destinations if destination not in destination_json]
+        if missing_destinations:
+            validation_errors.append(f"destinations 缺少目的地：{'、'.join(missing_destinations)}。")
+
+    # trip_segments_json：模型返回的分段行程。
+    trip_segments_json = travel_json.get("trip_segments")
+    if not isinstance(trip_segments_json, list):
+        validation_errors.append("trip_segments 必须是数组。")
+    else:
+        segment_map = {segment.get("destination"): segment for segment in trip_segments_json if isinstance(segment, dict)}
+        for expected_segment in parsed_request.get("trip_segments", []):
+            destination = expected_segment["destination"]
+            segment = segment_map.get(destination)
+            if not segment:
+                validation_errors.append(f"trip_segments 缺少目的地：{destination}。")
+                continue
+            if segment.get("days") != expected_segment["days"]:
+                validation_errors.append(f"{destination} days 不一致，应为 {expected_segment['days']}。")
+            if segment.get("nights") != expected_segment["nights"]:
+                validation_errors.append(f"{destination} nights 不一致，应为 {expected_segment['nights']}。")
+            if "days_inferred" not in segment:
+                validation_errors.append(f"{destination} 缺少 days_inferred 字段。")
+            if not str(segment.get("theme", "")).strip():
+                validation_errors.append(f"{destination} theme 不能为空。")
+            if expected_segment.get("days_inferred") and not str(segment.get("note", "")).strip():
+                validation_errors.append(f"{destination} 是默认推断天数，note 不能为空。")
+
+    # budget_json：模型返回的预算对象。
+    budget_json = travel_json.get("budget")
+    if not isinstance(budget_json, dict):
+        validation_errors.append("budget 必须是对象。")
+    else:
+        if parsed_request.get("budget_has_explicit_amount") and budget_json.get("amount") != parsed_request.get("budget_amount"):
+            validation_errors.append(f"budget.amount 不一致，应为 {parsed_request.get('budget_amount')}。")
+        if parsed_request.get("budget_currency") and budget_json.get("currency") != parsed_request.get("budget_currency"):
+            validation_errors.append(f"budget.currency 不一致，应为 {parsed_request.get('budget_currency')}。")
+        if not str(budget_json.get("level", "")).strip():
+            validation_errors.append("budget.level 不能为空。")
+
+    # preferences_json：模型返回的偏好列表。
+    preferences_json = travel_json.get("preferences")
+    if not isinstance(preferences_json, list):
+        validation_errors.append("preferences 必须是数组。")
+    else:
+        missing_preferences = [preference for preference in parsed_request["preferences"] if preference not in preferences_json]
+        if missing_preferences:
+            validation_errors.append(f"preferences 缺少用户明确偏好：{'、'.join(missing_preferences)}。")
+
+    # daily_itinerary：模型返回的每日行程数组。
+    daily_itinerary = travel_json.get("daily_itinerary")
+    if not isinstance(daily_itinerary, list):
+        return validation_errors + ["daily_itinerary 必须是数组。"]
+
+    if len(daily_itinerary) != expected_days:
+        validation_errors.append(f"daily_itinerary 必须 exactly {expected_days} 天，当前为 {len(daily_itinerary)} 天。")
+
+    # required_slots：每天必须包含的四个时间段。
+    required_slots = ["morning", "noon", "afternoon", "evening"]
+
+    # required_slot_fields：每个时间段对象必须包含的字段。
+    required_slot_fields = ["time", "place", "original_name", "reason", "duration", "transport", "booking_note"]
+
+    # generic_terms：不允许出现的空泛模板词。
+    generic_terms = ["核心街区", "本地风味餐厅", "主题体验", "夜景与晚餐区域"]
+
+    # seen_days/themes/places/segment_destinations：用于检查编号、主题、地点和目的地覆盖。
+    seen_days = set()
+    seen_themes = set()
+    seen_places = set()
+    seen_segment_destinations = set()
+
+    for day_index, day_item in enumerate(daily_itinerary, start=1):
+        if not isinstance(day_item, dict):
+            validation_errors.append(f"Day {day_index} 必须是对象。")
+            continue
+
+        day_number = day_item.get("day")
+        if day_number != day_index:
+            validation_errors.append(f"Day {day_index} 的 day 字段应为 {day_index}，当前为 {day_number}。")
+        if day_number in seen_days:
+            validation_errors.append(f"Day 编号重复：{day_number}。")
+        seen_days.add(day_number)
+
+        segment_destination = str(day_item.get("segment_destination", "")).strip()
+        if not segment_destination:
+            validation_errors.append(f"Day {day_index} segment_destination 不能为空。")
+        elif segment_destination not in expected_destinations:
+            validation_errors.append(f"Day {day_index} segment_destination 不在用户目的地中：{segment_destination}。")
+        seen_segment_destinations.add(segment_destination)
+
+        theme = str(day_item.get("theme", "")).strip()
+        if not theme:
+            validation_errors.append(f"Day {day_index} theme 不能为空。")
+        elif theme in seen_themes:
+            validation_errors.append(f"Day {day_index} theme 重复：{theme}。")
+        seen_themes.add(theme)
+
+        for slot_name in required_slots:
+            # slot_data：单个时间段对象。
+            slot_data = day_item.get(slot_name)
+            if not isinstance(slot_data, dict):
+                validation_errors.append(f"Day {day_index} 缺少 {slot_name} 对象。")
+                continue
+
+            for field_name in required_slot_fields:
+                field_value = slot_data.get(field_name)
+                if field_value is None or not str(field_value).strip():
+                    validation_errors.append(f"Day {day_index} {slot_name}.{field_name} 不能为空。")
+
+            slot_text = " ".join(str(slot_data.get(field_name, "")) for field_name in required_slot_fields)
+            if any(term in slot_text for term in generic_terms):
+                validation_errors.append(f"Day {day_index} {slot_name} 包含空泛模板词。")
+
+            place = str(slot_data.get("place", "")).strip()
+            if place:
+                if place in seen_places:
+                    validation_errors.append(f"重复安排地点：{place}。")
+                seen_places.add(place)
+
+    missing_days = [day for day in range(1, expected_days + 1) if day not in seen_days]
+    if missing_days:
+        validation_errors.append(f"daily_itinerary 缺少 Day {', Day '.join(str(day) for day in missing_days)}。")
+
+    missing_segment_destinations = [
+        destination for destination in expected_destinations if destination not in seen_segment_destinations
+    ]
+    if missing_segment_destinations:
+        validation_errors.append(f"daily_itinerary 未覆盖目的地：{'、'.join(missing_segment_destinations)}。")
+
+    # food_recommendations：模型返回的美食推荐数组。
+    food_recommendations = travel_json.get("food_recommendations")
+    if not isinstance(food_recommendations, list):
+        validation_errors.append("food_recommendations 必须是数组。")
+    elif not food_recommendations:
+        validation_errors.append("food_recommendations 不能为空。")
+    else:
+        # required_food_fields：每个美食推荐对象必须包含的字段。
+        required_food_fields = [
+            "destination",
+            "name_cn",
+            "name_original",
+            "location",
+            "recommended_dishes",
+            "reason",
+            "budget",
+            "booking_note",
+            "map_keyword",
+        ]
+
+        # seen_food_names：用于检查店铺名称是否重复。
+        seen_food_names = set()
+        for food_index, food_item in enumerate(food_recommendations, start=1):
+            if not isinstance(food_item, dict):
+                validation_errors.append(f"food_recommendations 第 {food_index} 项必须是对象。")
+                continue
+
+            for field_name in required_food_fields:
+                field_value = food_item.get(field_name)
+                if field_value is None or not str(field_value).strip():
+                    validation_errors.append(f"food_recommendations 第 {food_index} 项 {field_name} 不能为空。")
+
+            food_text = " ".join(str(value) for value in food_item.values())
+            if contains_forbidden_food_term(food_text):
+                validation_errors.append(f"food_recommendations 第 {food_index} 项包含泛泛占位内容。")
+
+            food_name_key = f"{food_item.get('name_cn', '')}|{food_item.get('name_original', '')}".strip()
+            if food_name_key in seen_food_names:
+                validation_errors.append(f"重复推荐店铺：{food_item.get('name_cn', '')}。")
+            seen_food_names.add(food_name_key)
+
+    return validation_errors
+
+
+def normalize_structured_travel_json(travel_json: dict, parsed_request: dict) -> dict:
+    """normalize_structured_travel_json：用系统识别参数覆盖 JSON 顶层关键字段，保证用户输入优先。"""
+
+    # normalized_json：复制后的结构化结果。
+    normalized_json = dict(travel_json)
+    normalized_json["trip_type"] = parsed_request.get("trip_type", "single_destination")
+    normalized_json["destination"] = parsed_request["destination"]
+    normalized_json["destinations"] = parsed_request.get("destinations", [parsed_request["destination"]])
+    normalized_json["total_days"] = parsed_request["days"]
+    normalized_json["days"] = parsed_request["days"]
+    normalized_json["nights"] = parsed_request["nights"]
+    normalized_json["preferences"] = parsed_request["preferences"]
+    normalized_json["trip_segments"] = [
+        {
+            "destination": segment["destination"],
+            "days": segment["days"],
+            "nights": segment["nights"],
+            "days_inferred": segment.get("days_inferred", False),
+            "theme": segment.get("theme") or get_province_route_note(segment["destination"]) or f"{segment['destination']}分段行程",
+            "note": segment.get("note", ""),
+        }
+        for segment in parsed_request.get("trip_segments", [])
+    ]
+    normalized_json["budget"] = {
+        "amount": parsed_request.get("budget_amount"),
+        "currency": parsed_request.get("budget_currency") or DEFAULT_BUDGET_CURRENCY,
+        "level": parsed_request.get("style") or parsed_request.get("budget_level"),
+    }
+    return normalized_json
+
+
+def build_json_repair_prompt(
+    original_output: str,
+    validation_errors: list[str],
+    parsed_request: dict,
+    facts_context: str,
+    generation_mode: str = GENERATION_MODE_FAST,
+) -> str:
+    """build_json_repair_prompt：根据校验错误要求 DeepSeek 只修复 JSON。"""
+
+    # error_text：校验错误说明。
+    error_text = "\n".join(f"- {error}" for error in validation_errors)
+
+    # optional_module_repair_text：快速版不强制修复深度模块。
+    optional_module_repair_text = (
+        "快速版不需要生成 packing_checklist/photo_spots；如原始 JSON 中缺失，可省略或返回空对象/空数组。"
+        if generation_mode == GENERATION_MODE_FAST
+        else "packing_checklist 必须包含 documents/payment_and_network/weather_and_clothing/electronics/medicine_and_emergency/photo_preparation/pre_departure_checks。\nphoto_spots 必须按每个目的地至少 4 个具体打卡点生成，每个打卡点包含 name/location/best_for/best_time/photo_tip/reminder。\n如果目的地包含香港，清单必须包含港澳通行证、有效签注、身份证、酒店订单截图、交通订单截图、少量港币现金、八达通 App 或实体卡、境外流量包 / 电话卡 / 漫游。"
+    )
+
+    top_level_repair_text = (
+        "trip_type/destination/destinations/total_days/trip_segments/daily_itinerary/food_recommendations；packing_checklist/photo_spots 可省略或为空"
+        if generation_mode == GENERATION_MODE_FAST
+        else "trip_type/destination/destinations/total_days/trip_segments/daily_itinerary/packing_checklist/photo_spots"
+    )
+
+    return f"""
+你刚才返回的每日行程 JSON 没有通过校验，错误如下：
+{error_text}
+
+请基于原始内容修复 JSON。
+必须返回合法 JSON。
+必须包含 exactly {parsed_request["days"]} 天。
+必须包含 {top_level_repair_text}。
+trip_segments 必须等于系统识别分段：
+{json.dumps(parsed_request.get("trip_segments", []), ensure_ascii=False, indent=2)}
+daily_itinerary 每天必须包含 segment_destination，且必须覆盖所有目的地。
+每天必须包含 morning/noon/afternoon/evening。
+每个时间段必须包含 time/place/original_name/reason/duration/transport/booking_note。
+food_recommendations 必须按每个目的地至少 4 项生成当地美食推荐榜。
+每个美食推荐必须包含 destination/name_cn/name_original/location/recommended_dishes/reason/budget/booking_note/map_keyword。
+美食推荐必须是具体店铺、餐厅、美食街或小吃区域，禁止写“建议结合当日行程区域确认”“适合穿插在当日行程中”“本地代表料理”“预约型餐厅”“甜品或咖啡”等占位内容。
+{optional_module_repair_text}
+必须保留系统识别参数：
+- destination: {parsed_request["destination"]}
+- destinations: {json.dumps(parsed_request.get("destinations", [parsed_request["destination"]]), ensure_ascii=False)}
+- total_days: {parsed_request["days"]}
+- days: {parsed_request["days"]}
+- nights: {parsed_request["nights"]}
+- budget_amount: {parsed_request.get("budget_amount")}
+- currency: {parsed_request.get("budget_currency") or DEFAULT_BUDGET_CURRENCY}
+- budget_level: {parsed_request.get("style") or parsed_request.get("budget_level")}
+- preferences: {json.dumps(parsed_request["preferences"], ensure_ascii=False)}
+
+联网事实校验 facts_context：
+{facts_context}
+
+原始输出：
+{original_output}
+
+不要输出 Markdown，不要解释，只返回 JSON。
+""".strip()
+
+
+def call_deepseek_chat(prompt_text: str, instructions: str) -> tuple[str | None, str | None]:
+    """call_deepseek_chat：使用 OpenAI SDK 调用 DeepSeek Chat Completions。"""
+
+    if OpenAI is None:
+        return None, "没有安装 openai 依赖，无法调用 DeepSeek。"
+
+    api_key = get_deepseek_api_key()
+    if not api_key:
+        return None, "未配置 DEEPSEEK_API_KEY，已切换本地兜底内容。"
+
+    try:
+        client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+        response = client.chat.completions.create(
+            model=get_deepseek_model_name(),
+            messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": prompt_text},
+            ],
+        )
+        content = response.choices[0].message.content
+        return (content.strip() if content else None), None
+    except Exception as error:
+        return None, f"DeepSeek API 调用失败：{error}"
+
+
+def call_deepseek_structured_json_api(
+    user_input: str,
+    parsed_request: dict,
+    facts_context: str,
+    generation_mode: str = GENERATION_MODE_FAST,
+) -> tuple[dict | None, str | None, list[str], str | None]:
+    """call_deepseek_structured_json_api：生成并校验结构化旅行 JSON，失败时自动修复一次。"""
+
+    # instructions：要求模型只返回 JSON 的系统提示。
+    instructions = """
+你是旅行规划结构化数据生成器。只返回合法 JSON，不输出 Markdown，不解释。
+所有用户明确输入的目的地、天数、预算、货币和偏好优先级最高。
+不要编造门票、预约、开放时间、景区政策等实时信息。
+""".strip()
+
+    # json_prompt：第一次生成结构化 JSON 的提示词。
+    json_prompt = build_structured_json_prompt(user_input, parsed_request, facts_context, generation_mode)
+
+    # raw_output：第一次模型原始输出。
+    raw_output, api_message = call_deepseek_chat(json_prompt, instructions)
+    if not raw_output:
+        return None, raw_output, [api_message or "DeepSeek 没有返回结构化 JSON。"], api_message
+
+    # travel_json：第一次解析出的 JSON。
+    travel_json, parse_errors = parse_structured_json_output(raw_output)
+    validation_errors = parse_errors or validate_structured_travel_json(travel_json, parsed_request)
+    if not validation_errors and travel_json:
+        return normalize_structured_travel_json(travel_json, parsed_request), raw_output, [], None
+
+    # repair_prompt：JSON 校验失败后的修复提示。
+    repair_prompt = build_json_repair_prompt(raw_output, validation_errors, parsed_request, facts_context, generation_mode)
+
+    # repaired_output：修复后的模型原始输出。
+    repaired_output, repair_message = call_deepseek_chat(repair_prompt, instructions)
+    if not repaired_output:
+        return None, raw_output, validation_errors + [repair_message or "DeepSeek JSON 修复没有返回内容。"], repair_message
+
+    # repaired_json：修复后解析出的 JSON。
+    repaired_json, repair_parse_errors = parse_structured_json_output(repaired_output)
+    repair_errors = repair_parse_errors or validate_structured_travel_json(repaired_json, parsed_request)
+    if repair_errors:
+        return None, repaired_output, repair_errors, "每日行程 JSON 修复后仍未通过校验。"
+
+    return normalize_structured_travel_json(repaired_json, parsed_request), repaired_output, [], "每日行程 JSON 第一次未通过校验，已自动修复。"
+
+
+def build_markdown_from_json_prompt(
+    user_input: str,
+    parsed_request: dict,
+    facts_context: str,
+    travel_json: dict,
+    generation_mode: str = GENERATION_MODE_DEEP,
+) -> str:
+    """build_markdown_from_json_prompt：基于结构化 JSON 生成 Markdown 攻略提示词。"""
+
+    # structured_json_text：结构化旅行 JSON 文本。
+    structured_json_text = json.dumps(travel_json, ensure_ascii=False, indent=2)
+
+    # is_fast_mode：快速版只写核心攻略，深度版写完整报告。
+    is_fast_mode = generation_mode == GENERATION_MODE_FAST
+
+    module_rule_text = (
+        """
+11. 当前是快速版：不要生成“旅行准备清单”和“拍照打卡推荐”长篇内容。
+12. 每个时间段描述控制在 2-3 句话，整体内容简洁，不要写成长篇报告。
+13. 必须包含以下二级标题，并保持标题文字完全一致：
+## 旅行封面文案
+## 详细旅游攻略
+## 每日行程
+## 美食推荐
+## 预算估算
+## 信息来源与更新时间
+""".strip()
+        if is_fast_mode
+        else """
+11. “旅行准备清单”必须基于 JSON 中的 packing_checklist，按证件与通行、支付与通信、天气与穿搭、电子设备、药品与应急、拍照与出片准备、出发前确认事项分组写。
+12. “拍照打卡推荐”必须基于 JSON 中的 photo_spots，多目的地按目的地分组，每个目的地至少 4 个具体打卡点。
+13. 必须包含以下二级标题，并保持标题文字完全一致：
+## 旅行封面文案
+## 详细旅游攻略
+## 每日行程
+## 美食推荐
+## 交通建议
+## 预算估算
+## 避坑提醒
+## 旅行准备清单
+## 拍照打卡推荐
+## 信息来源与更新时间
+""".strip()
+    )
+
+    return f"""
+用户原始需求：
+{user_input}
+
+系统识别参数：
+- 目的地：{parsed_request["destination"]}
+- 旅行天数：{parsed_request["days"]} 天 {parsed_request["nights"]} 晚
+- 预算：{parsed_request["budget"]}
+- 偏好：{"、".join(parsed_request["preferences"])}
+
+联网事实校验 facts_context：
+{facts_context}
+
+结构化 JSON：
+{structured_json_text}
+
+请基于上面的结构化 JSON 生成中文 Markdown 攻略。
+要求：
+1. 不要改变 JSON 中的目的地、天数、预算、偏好和 daily_itinerary。
+2. 用户明确提到的所有目的地都必须出现在攻略中，不能只写第一个目的地。
+3. 如果是多目的地，先写总览，例如“南京 3 天 + 江西默认 3 天”，再按分段展示。
+4. 每日行程必须按 JSON 中的 daily_itinerary 写，不要自由新增重复路线；Day 编号必须连续。
+5. 如果 trip_segments 中 days_inferred=true，必须明确说明该目的地天数是系统默认推断。
+6. 如果目的地是省份、国家或大区域，必须说明系统选择了具体城市路线。
+7. 门票、预约、开放时间、景区政策必须优先依据 facts_context；没有明确搜索结果时写“建议出行前二次确认”。
+8. 内容具体、可执行，保留中文名 + 英文/原名。
+9. “美食推荐”必须基于 JSON 中的 food_recommendations，写成“当地美食推荐榜”，每条必须写店名中文名、英文/当地原名、具体地址或明确区域、推荐菜、人均预算、推荐理由、排队或预约提醒和地图搜索关键词。
+10. 美食推荐禁止写“建议结合当日行程区域确认”“适合穿插在当日行程中”“本地代表料理”“预约型餐厅”“甜品或咖啡”等占位内容；如果无法确认具体门牌号，写明确区域和可搜索关键词。
+{module_rule_text}
+""".strip()
+
+
+def build_markdown_from_structured_json(
+    travel_json: dict,
+    parsed_request: dict,
+    facts_context: str,
+    include_deep_modules: bool = True,
+) -> str:
+    """build_markdown_from_structured_json：当 Markdown 二次生成失败时，用合格 JSON 生成可复制攻略。"""
+
+    # source_updated_at：攻略信息更新时间。
+    source_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # destination/days/nights：安全读取用户明确识别参数，避免快速版 fallback 因边缘字段缺失报错。
+    destination = parsed_request.get("destination") or travel_json.get("destination") or "目的地"
+    days = parsed_request.get("days") or travel_json.get("total_days") or travel_json.get("days") or 3
+    nights = parsed_request.get("nights")
+    if nights is None:
+        nights = travel_json.get("total_nights") or travel_json.get("nights") or max(int(days) - 1, 0)
+
+    # budget_text：预算展示文案，兼容 parsed_request 文本和 JSON budget 对象。
+    budget_text = parsed_request.get("budget")
+    if not budget_text:
+        json_budget = travel_json.get("budget", {})
+        if isinstance(json_budget, dict):
+            amount_text = json_budget.get("amount")
+            currency_text = json_budget.get("currency") or DEFAULT_BUDGET_CURRENCY
+            level_text = json_budget.get("level") or "普通"
+            budget_text = f"{amount_text or '未填写'} {currency_text}（{level_text}）"
+        else:
+            budget_text = str(json_budget or "普通预算")
+
+    # preferences：旅行偏好列表，兼容字符串和数组。
+    preferences = parsed_request.get("preferences") or travel_json.get("preferences") or []
+    if isinstance(preferences, str):
+        preferences = [part.strip() for part in re.split(r"[、,，/|]", preferences) if part.strip()]
+    if not isinstance(preferences, list):
+        preferences = []
+    preferences_text = "、".join(str(item).strip() for item in preferences if str(item).strip()) or "轻松游览"
+
+    # itinerary_lines：从结构化 JSON 生成的每日行程 Markdown。
+    itinerary_lines = []
+    for day_item in travel_json.get("daily_itinerary", []):
+        if not isinstance(day_item, dict):
+            continue
+        segment_prefix = f"{day_item.get('segment_destination') or destination}｜"
+        day_number = day_item.get("day") or len(itinerary_lines) + 1
+        day_theme = clean_user_facing_text(day_item.get("theme") or f"第 {day_number} 天")
+        itinerary_lines.append(f"### Day {day_number}：{segment_prefix}{day_theme}")
+        for slot_key, slot_label in [("morning", "上午"), ("noon", "中午"), ("afternoon", "下午"), ("evening", "晚上")]:
+            slot = day_item.get(slot_key, {})
+            if not isinstance(slot, dict):
+                continue
+            slot_place = clean_user_facing_text(slot.get("place") or "待确认地点")
+            slot_reason = clean_user_facing_text(slot.get("reason") or "建议出行前再次确认细节。")
+            slot_duration = clean_duration(slot.get("duration"))
+            slot_transport = clean_user_facing_text(slot.get("transport") or "交通方式请结合当日路线确认。")
+            slot_booking_note = clean_user_facing_text(slot.get("booking_note") or "建议出行前二次确认。")
+            slot_parts = [slot_place, slot_reason]
+            if slot_duration:
+                slot_parts.append(slot_duration)
+            slot_parts.append(slot_transport)
+            itinerary_lines.append(
+                f"- {slot_label}：{'｜'.join(slot_parts)}；{slot_booking_note}"
+            )
+
+    # food_lines：从结构化 JSON 生成的美食推荐 Markdown。
+    food_lines = []
+    for food_item in build_food_cards_from_json(travel_json, parsed_request):
+        food_title = food_item.get("title", "美食点")
+        if food_item.get("name_original") and food_item["name_original"] != food_title:
+            food_title = f"{food_title}（{food_item['name_original']}）"
+        food_lines.append(
+            f"- {food_title}：地址 {food_item.get('location', '地址请以地图 App 最新结果为准')}｜"
+            f"推荐 {food_item.get('recommended_dishes', '推荐菜请以菜单为准')}｜{food_item.get('budget', '人均预算待确认')}｜"
+            f"{food_item.get('reason', '适合作为当地风味参考。')}｜"
+            f"{food_item.get('booking_note', '热门时段可能排队，建议出行前确认。')}｜"
+            f"地图搜索：{food_item.get('map_keyword', food_title)}"
+        )
+
+    # packing_markdown/photo_markdown：深度版才生成旅行清单和拍照打卡 Markdown。
+    packing_markdown = ""
+    photo_markdown = ""
+    if include_deep_modules:
+        packing_markdown = build_packing_markdown(build_packing_checklist(parsed_request, None, travel_json))
+        photo_markdown = build_photo_spots_markdown(build_photo_spots(parsed_request, travel_json), parsed_request)
+
+    # traffic_markdown/avoid_markdown：深度版才输出交通和避坑长模块，快速版保持核心内容更轻。
+    traffic_markdown = ""
+    avoid_markdown = ""
+    if include_deep_modules:
+        traffic_markdown = """
+## 交通建议
+- 每天优先围绕同一区域规划，减少跨区往返。
+- 景区门票、预约和开放时间建议出行前二次确认。
+""".strip()
+        avoid_markdown = """
+## 避坑提醒
+- 不要把热门景点、热门餐厅和远距离交通挤在同一天。
+- 对所有可能变化的信息，建议出行前二次确认。
+""".strip()
+
+    # segment_overview_text：多目的地分段总览。
+    trip_segments = parsed_request.get("trip_segments") or travel_json.get("trip_segments") or []
+    segment_overview_text = " + ".join(
+        f"{segment.get('destination', destination)}{'默认' if segment.get('days_inferred') else ''}{segment.get('days', 3)}天"
+        for segment in trip_segments
+        if isinstance(segment, dict)
+    )
+
+    # segment_note_lines：多目的地或省份推断说明。
+    segment_note_lines = "\n".join(f"- {note}" for note in parsed_request.get("trip_notes", []))
+
+    return f"""
+## 旅行封面文案
+{destination} {days} 天 {nights} 晚旅行计划：围绕 {preferences_text} 安排路线。
+
+## 详细旅游攻略
+- 目的地：{destination}
+- 行程总览：{segment_overview_text or destination}
+- 行程长度：{days} 天 {nights} 晚
+- 预算：{budget_text}
+- 旅行风格：{preferences_text}
+- 说明：本攻略根据已整理的行程数据生成。
+{segment_note_lines}
+
+## 每日行程
+{chr(10).join(itinerary_lines)}
+
+## 美食推荐
+{chr(10).join(food_lines) if food_lines else "- 该目的地的具体美食信息不足，请重新生成或开启联网搜索。"}
+
+{traffic_markdown}
+
+## 预算估算
+- 用户预算：{budget_text}
+- 交通、住宿、餐饮、门票体验和机动费用建议按实际日期二次核算。
+
+{avoid_markdown}
+
+{packing_markdown}
+
+{photo_markdown}
+
+## 信息来源与更新时间
+- 更新时间：{source_updated_at}
+- 来源说明：本攻略由 AI 根据你的输入和当前可用信息整理；门票、预约、开放时间等仍需出行前二次确认。
+- 联网事实状态：{facts_context.splitlines()[0] if facts_context else "未启用联网搜索"}
+""".strip()
+
+
+def extract_markdown_section_text(markdown_text: str, heading: str) -> str:
+    """extract_markdown_section_text：从 Markdown 中提取指定二级标题下的正文。"""
+
+    # normalized_markdown：保证开头有换行，便于正则匹配二级标题。
+    normalized_markdown = "\n" + markdown_text.strip()
+
+    # section_pattern：匹配指定二级标题到下一个二级标题之间的内容。
+    section_pattern = rf"\n##\s+{re.escape(heading)}\s*\n([\s\S]*?)(?=\n##\s+|\Z)"
+    match = re.search(section_pattern, normalized_markdown)
+    return match.group(1).strip() if match else ""
+
+
+def parse_itinerary_day_blocks(markdown_text: str) -> list[dict]:
+    """parse_itinerary_day_blocks：解析 Markdown 每日行程区中的 Day 块。"""
+
+    # itinerary_text：每日行程区域 Markdown。
+    itinerary_text = extract_markdown_section_text(markdown_text, "每日行程")
+    if not itinerary_text:
+        return []
+
+    # day_matches：匹配 Day 标题。
+    day_matches = list(re.finditer(r"(?m)^###\s*Day\s*([0-9一二两三四五六七八九十]+)\s*[：:]?\s*(.*?)\s*$", itinerary_text))
+
+    # day_blocks：解析后的 Day 数据。
+    day_blocks = []
+    for index, match in enumerate(day_matches):
+        start_index = match.end()
+        end_index = day_matches[index + 1].start() if index + 1 < len(day_matches) else len(itinerary_text)
+        day_number = parse_chinese_number(match.group(1))
+        theme = clean_user_facing_text(match.group(2).strip()) or f"Day {day_number}"
+        body = itinerary_text[start_index:end_index].strip()
+        day_blocks.append({"day": day_number, "theme": theme, "body": body})
+
+    return day_blocks
+
+
+def build_demo_markdown(parsed_request: dict, facts_context: str = "") -> str:
+    """build_demo_markdown：没有 API Key 或 API 失败时生成本地演示攻略。"""
+
+    # destination：攻略目的地。
+    destination = parsed_request["destination"]
+
+    # days：旅行天数。
+    days = parsed_request["days"]
+
+    # nights：住宿晚数。
+    nights = parsed_request["nights"]
+
+    # budget：预算档位。
+    budget = parsed_request["budget"]
+
+    # budget_exchange_hint：国外目的地预算粗略换算提示。
+    budget_exchange_hint = parsed_request.get("budget_exchange_hint")
+
+    # preferences_text：用户旅行偏好。
+    preferences_text = "、".join(parsed_request["preferences"])
+
+    # source_updated_at：本地演示攻略的信息更新时间。
+    source_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # source_note：本地演示攻略的信息来源说明。
+    source_note = (
+        "当前未使用实时搜索结果；门票、预约、开放时间建议出行前再次核对。"
+        if "联网事实校验状态：已执行" not in facts_context and "联网事实校验状态：缓存命中" not in facts_context
+        else "已传入联网搜索 facts_context；具体门票、预约和开放时间请以搜索来源及出行前二次确认为准。"
+    )
+
+    return f"""
+## 旅行封面文案
+{destination} {days} 天 {nights} 晚旅行计划：把 {preferences_text} 放进行程主线，用轻松但不松散的节奏完成一次有记忆点的城市探索。
+
+## 详细旅游攻略
+- 目的地：{destination}
+- 行程长度：{days} 天 {nights} 晚
+- 预算：{budget}
+- 旅行风格：{preferences_text}
+- 规划思路：第一天熟悉城市动线，第二天深入主题体验，最后一天安排轻量活动和购物补漏。
+{f"- 换算提示：{budget_exchange_hint}" if budget_exchange_hint else ""}
+
+## 每日行程
+本次没有获取到可展示的每日行程细节，请重新生成以获得更完整的路线。
+
+## 美食推荐
+- 该目的地的具体美食信息不足，请重新生成或开启联网搜索。
+
+## 交通建议
+- 城市内优先使用地铁、公交或官方交通卡，减少频繁打车。
+- 每天尽量围绕一个区域规划，避免跨城式来回移动。
+- 机场或车站到酒店先查官方线路，再对比打车价格。
+- 如果有大件行李，最后一天优先选择寄存点或酒店寄存。
+
+## 预算估算
+- 用户预算：{budget}
+{f"- {budget_exchange_hint}" if budget_exchange_hint else ""}
+- 交通：经济预算约 150-300 人民币(CNY)/人，普通预算约 300-600 人民币(CNY)/人，高预算按实际打车和跨城交通增加。
+- 住宿：经济预算约 300-600 人民币(CNY)/晚，普通预算约 600-1200 人民币(CNY)/晚，高预算约 1200 人民币(CNY)/晚以上。
+- 餐饮：约 150-350 人民币(CNY)/人/天，热门餐厅和预约餐厅另算。
+- 门票体验：约 100-500 人民币(CNY)/人，主题展、乐园、演出费用可能更高。
+- 机动费用：建议预留总预算的 10%-20%。
+
+## 避坑提醒
+- 不要把热门景点、热门餐厅和远距离交通挤在同一天。
+- 不要只看社交平台种草，出发前确认营业时间、预约方式和交通路线。
+- 夜景点通常受天气影响明显，建议保留备选方案。
+- 购物和伴手礼尽量放在后半程，避免一路背负行李。
+- 本攻略为第一版演示内容，真实出行前请再次确认价格、营业时间和交通信息。
+
+## 信息来源与更新时间
+- 更新时间：{source_updated_at}
+- 来源说明：{source_note}
+- 门票、预约、开放时间：根据搜索结果整理，仍需出行前二次确认；如果没有联网结果，请勿将本地演示内容视为实时信息。
+""".strip()
+
+
+def call_deepseek_markdown_from_json_api(
+    user_input: str,
+    parsed_request: dict,
+    facts_context: str,
+    travel_json: dict,
+    generation_mode: str = GENERATION_MODE_DEEP,
+) -> tuple[str | None, str | None]:
+    """call_deepseek_markdown_from_json_api：基于合格 JSON 生成 Markdown 攻略。"""
+
+    # instructions：给模型的 Markdown 写作角色要求。
+    instructions = """
+你是一名资深旅行编辑和行程规划师。请基于给定 JSON 写中文 Markdown 攻略。
+不能改变 JSON 中的行程天数、地点、预算和偏好；不要编造实时营业状态。
+""".strip()
+
+    # markdown_prompt：基于结构化 JSON 生成 Markdown 的提示词。
+    markdown_prompt = build_markdown_from_json_prompt(user_input, parsed_request, facts_context, travel_json, generation_mode)
+    return call_deepseek_chat(markdown_prompt, instructions)
+
+
+def generate_travel_content(
+    user_input: str,
+    parsed_request: dict,
+    facts_context: str,
+    generation_mode: str = GENERATION_MODE_FAST,
+) -> tuple[str, str | None, dict | None, str | None, list[str]]:
+    """generate_travel_content：先生成结构化 JSON，再基于 JSON 生成 Markdown 攻略。"""
+
+    # travel_json：用于页面时间线渲染的结构化旅行数据。
+    travel_json, json_raw, json_errors, json_message = call_deepseek_structured_json_api(
+        user_input,
+        parsed_request,
+        facts_context,
+        generation_mode,
+    )
+
+    if not travel_json:
+        # demo_markdown：结构化 JSON 失败时仍保留页面其他区域，不使用假行程补齐。
+        demo_markdown = build_demo_markdown(parsed_request, facts_context)
+        error_summary = "；".join(json_errors[:4]) if json_errors else "结构化 JSON 未生成。"
+        api_message = f"每日行程 JSON 未通过校验：{error_summary}"
+        if json_message and json_message not in api_message:
+            api_message = f"{api_message}；{json_message}"
+        return demo_markdown, api_message, None, json_raw, json_errors
+
+    # 快速版：跳过第二次 DeepSeek Markdown 写作，本地基于 JSON 生成可复制攻略，减少等待时间。
+    if generation_mode == GENERATION_MODE_FAST:
+        fast_markdown = build_markdown_from_structured_json(
+            travel_json,
+            parsed_request,
+            facts_context,
+            include_deep_modules=False,
+        )
+        api_messages = [message for message in [json_message, "快速版已跳过长篇清单和拍照打卡生成。"] if message]
+        return fast_markdown, "；".join(api_messages) or None, travel_json, json_raw, []
+
+    # markdown_text：深度版基于合格 JSON 生成完整 Markdown 攻略。
+    markdown_text, markdown_message = call_deepseek_markdown_from_json_api(
+        user_input,
+        parsed_request,
+        facts_context,
+        travel_json,
+        generation_mode,
+    )
+
+    # api_messages：需要展示给用户的生成状态说明。
+    api_messages = []
+    if json_message:
+        api_messages.append(json_message)
+
+    if markdown_text:
+        if markdown_message:
+            api_messages.append(markdown_message)
+        return markdown_text, "；".join(api_messages) or None, travel_json, json_raw, []
+
+    # Markdown 二次生成失败时，用已通过校验的 JSON 生成可复制攻略，不生成假行程。
+    fallback_markdown = build_markdown_from_structured_json(
+        travel_json,
+        parsed_request,
+        facts_context,
+        include_deep_modules=generation_mode == GENERATION_MODE_DEEP,
+    )
+    if markdown_message:
+        api_messages.append(f"Markdown 生成失败，已根据合格 JSON 生成可复制攻略：{markdown_message}")
+    else:
+        api_messages.append("Markdown 生成失败，已根据合格 JSON 生成可复制攻略。")
+
+    return fallback_markdown, "；".join(api_messages), travel_json, json_raw, []
+
+
+def generate_cover_image_url(parsed_request: dict) -> str:
+    """generate_cover_image_url：生成封面图地址，后续可替换为图片生成 API。"""
+
+    # destination：封面图上显示的目的地。
+    destination = parsed_request["destination"]
+
+    # preferences_text：封面图上显示的旅行偏好。
+    preferences_text = " / ".join(parsed_request["preferences"][:4])
+
+    # cover_svg：使用旅行杂志感 SVG 占位图，保证没有图片 API 时也能显示大封面。
+    cover_svg = f"""
+    <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+      <defs>
+        <linearGradient id="sky" x1="0" x2="1" y1="0" y2="1">
+          <stop offset="0%" stop-color="#111827"/>
+          <stop offset="28%" stop-color="#26324f"/>
+          <stop offset="62%" stop-color="#92400e"/>
+          <stop offset="100%" stop-color="#020617"/>
+        </linearGradient>
+        <linearGradient id="sunset" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stop-color="#fef3c7" stop-opacity="0.86"/>
+          <stop offset="42%" stop-color="#fb923c" stop-opacity="0.38"/>
+          <stop offset="100%" stop-color="#020617" stop-opacity="0"/>
+        </linearGradient>
+        <linearGradient id="water" x1="0" x2="1" y1="0" y2="0">
+          <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.72"/>
+          <stop offset="52%" stop-color="#14b8a6" stop-opacity="0.42"/>
+          <stop offset="100%" stop-color="#f97316" stop-opacity="0.48"/>
+        </linearGradient>
+        <filter id="grain">
+          <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" stitchTiles="stitch"/>
+          <feColorMatrix type="saturate" values="0"/>
+          <feComponentTransfer>
+            <feFuncA type="table" tableValues="0 0.18"/>
+          </feComponentTransfer>
+        </filter>
+        <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+          <feDropShadow dx="0" dy="24" stdDeviation="24" flood-color="#020617" flood-opacity="0.42"/>
+        </filter>
+        <clipPath id="photoClip">
+          <rect x="760" y="115" width="470" height="560" rx="32"/>
+        </clipPath>
+      </defs>
+      <rect width="1600" height="900" fill="url(#sky)"/>
+      <rect width="1600" height="900" fill="url(#sunset)" opacity="0.62"/>
+      <rect width="1600" height="900" filter="url(#grain)" opacity="0.36"/>
+      <path d="M0 565 C165 470 305 515 440 430 C570 350 690 392 820 315 C1010 205 1190 295 1600 185 L1600 900 L0 900 Z" fill="#0f172a" opacity="0.76"/>
+      <path d="M0 625 C230 508 365 610 545 515 C710 428 865 560 1020 468 C1188 368 1365 438 1600 315 L1600 900 L0 900 Z" fill="#1e293b" opacity="0.72"/>
+      <path d="M0 690 C260 590 430 710 675 625 C910 544 1060 690 1308 568 C1435 506 1510 520 1600 475 L1600 900 L0 900 Z" fill="url(#water)" opacity="0.78"/>
+      <path d="M0 742 C210 700 390 785 640 735 C880 688 1030 790 1285 708 C1430 662 1510 675 1600 642 L1600 900 L0 900 Z" fill="#020617" opacity="0.70"/>
+      <g filter="url(#softShadow)" opacity="0.95">
+        <rect x="760" y="115" width="470" height="560" rx="32" fill="#f8fafc" opacity="0.92"/>
+        <g clip-path="url(#photoClip)">
+          <rect x="760" y="115" width="470" height="560" fill="#0f172a"/>
+          <rect x="760" y="115" width="470" height="560" fill="url(#sky)" opacity="0.52"/>
+          <circle cx="1110" cy="230" r="72" fill="#fde68a" opacity="0.86"/>
+          <path d="M760 430 C845 360 910 380 975 320 C1055 245 1115 360 1230 275 L1230 675 L760 675 Z" fill="#334155"/>
+          <path d="M760 520 C900 455 960 550 1080 488 C1145 455 1188 470 1230 430 L1230 675 L760 675 Z" fill="#0f766e" opacity="0.7"/>
+          <path d="M760 575 C860 540 940 615 1055 558 C1120 524 1170 540 1230 512 L1230 675 L760 675 Z" fill="#0ea5e9" opacity="0.55"/>
+          <path d="M860 675 L1018 444 L1135 675 Z" fill="#f8fafc" opacity="0.82"/>
+          <path d="M924 675 L1018 500 L1080 675 Z" fill="#f59e0b" opacity="0.55"/>
+        </g>
+      </g>
+      <path d="M1320 170 C1390 210 1425 268 1450 350" stroke="#fde68a" stroke-width="3" stroke-dasharray="12 16" fill="none" opacity="0.55"/>
+      <path d="M1450 350 l28 -12 l-20 31 z" fill="#fde68a" opacity="0.75"/>
+      <g opacity="0.78">
+        <rect x="120" y="640" width="420" height="3" fill="#fde68a"/>
+        <rect x="120" y="665" width="315" height="3" fill="#f8fafc" opacity="0.52"/>
+        <rect x="120" y="690" width="250" height="3" fill="#f8fafc" opacity="0.34"/>
+      </g>
+      <text x="126" y="145" fill="#fde68a" font-size="32" font-family="Arial, sans-serif" letter-spacing="6">AI TRAVEL MAGAZINE</text>
+      <text x="126" y="232" fill="#ffffff" font-size="72" font-family="Arial, sans-serif" font-weight="700">{html.escape(destination)}</text>
+      <text x="130" y="292" fill="#e5e7eb" font-size="30" font-family="Arial, sans-serif">{html.escape(preferences_text)}</text>
+    </svg>
+    """
+
+    return "data:image/svg+xml;charset=utf-8," + quote(cover_svg)
+
+
+def split_markdown_sections(markdown_text: str) -> dict:
+    """split_markdown_sections：把 Markdown 按二级标题拆成多个展示卡片。"""
+
+    # section_map：保存标题和正文的对应关系。
+    section_map = {}
+
+    # normalized_markdown：保证文本开头有换行，方便正则切分。
+    normalized_markdown = "\n" + markdown_text.strip()
+
+    # matches：匹配所有“## 标题”和标题后正文。
+    matches = re.finditer(r"\n##\s+(.+?)\n([\s\S]*?)(?=\n##\s+|\Z)", normalized_markdown)
+    for match in matches:
+        title = clean_user_facing_text(match.group(1).strip())
+        content = match.group(2).strip()
+        if title:
+            section_map[title] = content
+
+    return section_map
+
+
+def clean_markdown_text(markdown_text: str) -> str:
+    """clean_markdown_text：清理 Markdown 符号，方便放进自定义 HTML 卡片。"""
+
+    # cleaned_text：去掉列表符号、粗体和多余空格后的文本。
+    if markdown_text is None:
+        return ""
+
+    cleaned_text = re.sub(r"^[\-\*\d\.\s]+", "", str(markdown_text).strip())
+    cleaned_text = re.sub(r"[*`#]+", "", cleaned_text)
+    return cleaned_text.strip()
+
+
+def is_meaningful_text(value: object) -> bool:
+    """is_meaningful_text：判断文本是否有真实内容，过滤空值和无意义符号。"""
+
+    # text_value：清理后的文本。
+    text_value = clean_markdown_text(str(value) if value is not None else "")
+    if not text_value:
+        return False
+    if text_value.lower() in {"none", "null", "nan", "n/a", "无", "暂无", "待确认"}:
+        return False
+    if re.fullmatch(r"[\s\W_]+", text_value):
+        return False
+    return True
+
+
+def clean_duration(value: object) -> str:
+    """clean_duration：清洗每日行程耗时字段，避免显示只有单位的“小时”。"""
+
+    # duration_text：标准化后的耗时文本。
+    duration_text = str(value).strip() if value is not None else ""
+    duration_text = re.sub(r"[*`#]+", "", duration_text)
+    duration_text = re.sub(r"^[\-*\s]+", "", duration_text)
+    duration_text = re.sub(r"^\d+[.、]\s+", "", duration_text)
+    duration_text = re.sub(r"^(?:预计)?耗时\s*[：:]\s*", "", duration_text).strip()
+
+    if not duration_text or duration_text.lower() in {"none", "null", "nan", "n/a", "无", "暂无", "待确认"}:
+        return ""
+    if duration_text in {"小时", "分钟", "约小时", "约分钟", "h", "hr", "hrs"}:
+        return ""
+    if re.fullmatch(r"(?:约)?\s*(?:小时|分钟|h|hr|hrs)", duration_text, flags=re.IGNORECASE):
+        return ""
+    if re.fullmatch(r"\d+(?:\.\d+)?", duration_text):
+        return f"约{duration_text}小时"
+    if re.search(r"\d|半小时|一小时|两小时|二小时|三小时|四小时|五小时|半天|全天", duration_text):
+        return duration_text
+    if any(unit in duration_text for unit in ["小时", "分钟"]) and not re.search(r"\d|半|一|两|二|三|四|五|六|七|八|九|十", duration_text):
+        return ""
+    return duration_text
+
+
+def clean_time_range(value: object, period: str) -> str:
+    """clean_time_range：清洗时间段，避免手机端显示“:00-10:00”这类残缺时间。"""
+
+    period_text = str(period).strip() if period is not None else "时间段"
+    raw_time = str(value).strip() if value is not None else ""
+    raw_time = re.sub(r"[*`#]+", "", raw_time)
+    if re.match(r"^(?:上午|中午|下午|晚上|早上|午餐|夜间)\s*[:：]\d{2}", raw_time):
+        return "时间待确认"
+    raw_time = re.sub(r"^(?:上午|中午|下午|晚上|早上|午餐|夜间)\s*[｜|:：-]?\s*", "", raw_time).strip()
+    raw_time = raw_time.replace("－", "-").replace("—", "-").replace("–", "-").replace("~", "-").replace("至", "-")
+    raw_time = re.sub(r"\s+", "", raw_time)
+
+    if not raw_time or raw_time.lower() in {"none", "null", "nan", "n/a"}:
+        return "时间待确认"
+
+    if re.match(r"^[:：]\d{2}", raw_time) or re.match(r"^-", raw_time) or re.search(r"-[:：]\d{2}", raw_time):
+        return "时间待确认"
+
+    time_match = re.search(r"(\d{1,2}:\d{2})-(\d{1,2}:\d{2})", raw_time)
+    if not time_match:
+        single_time_match = re.search(r"\d{1,2}:\d{2}", raw_time)
+        return single_time_match.group(0) if single_time_match else "时间待确认"
+
+    start_time, end_time = time_match.groups()
+    start_hour = int(start_time.split(":", 1)[0])
+    end_hour = int(end_time.split(":", 1)[0])
+    if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+        return "时间待确认"
+
+    if len(start_time.split(":", 1)[0]) == 1:
+        start_time = "0" + start_time
+    if len(end_time.split(":", 1)[0]) == 1:
+        end_time = "0" + end_time
+    return f"{start_time}-{end_time}"
+
+
+def clean_user_facing_text(text: object) -> str:
+    """clean_user_facing_text：清理普通用户界面中的内部技术提示词。"""
+
+    # cleaned_text：用户界面可展示文本。
+    cleaned_text = clean_markdown_text(str(text) if text is not None else "")
+    internal_patterns = [
+        r"（?严格遵循\s*JSON\s*中的时间与地点安排）?",
+        r"\(?严格遵循\s*JSON\s*中的时间与地点安排\)?",
+        r"（?严格遵循结构化数据中的时间与地点安排）?",
+        r"结构校验",
+        r"完整性校验",
+        r"默认模板(?:补齐)?",
+        r"开发者调试",
+        r"缓存命中",
+        r"Tavily",
+        r"fallback",
+        r"basic search",
+        r"API\s*状态",
+        r"联网实时校验状态",
+    ]
+    for pattern in internal_patterns:
+        cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = cleaned_text.replace("JSON", "").replace("json", "")
+    cleaned_text = re.sub(r"[（(]\s*[）)]", "", cleaned_text)
+    cleaned_text = re.sub(r"\s{2,}", " ", cleaned_text).strip(" ：:-｜|")
+    return cleaned_text
+
+
+def extract_bullet_items(section_text: str, max_items: int = 6) -> list[str]:
+    """extract_bullet_items：从 Markdown 段落中提取列表项。"""
+
+    # item_list：从 Markdown 中提取出的列表内容。
+    item_list = []
+    for line in section_text.splitlines():
+        stripped_line = line.strip()
+        if re.match(r"^[-*]\s+", stripped_line) or re.match(r"^\d+[.、]\s+", stripped_line):
+            item = clean_markdown_text(stripped_line)
+            if item:
+                item_list.append(item)
+
+    if not item_list and section_text.strip():
+        # fallback_lines：当模型没有使用列表时，按非空行兜底提取。
+        fallback_lines = [clean_markdown_text(line) for line in section_text.splitlines() if clean_markdown_text(line)]
+        item_list = fallback_lines
+
+    return item_list[:max_items]
+
+
+def get_forbidden_food_terms() -> list[str]:
+    """get_forbidden_food_terms：返回美食卡片中不允许展示的占位词。"""
+
+    return [
+        "建议结合当日行程区域确认",
+        "适合插入当日行程",
+        "适合穿插在当日行程中",
+        "靠近当日行程附近",
+        "当日行程附近",
+        "根据当天路线安排",
+        "根据当日行程安排",
+        "作为临时补位",
+        "甜品或咖啡",
+        "预约型餐厅",
+        "本地代表料理",
+        "地图搜索：甜品或咖啡",
+    ]
+
+
+def contains_forbidden_food_term(food_text: str) -> bool:
+    """contains_forbidden_food_term：判断美食文本是否是泛泛占位内容。"""
+
+    # normalized_text：用于占位词检测的文本。
+    normalized_text = clean_markdown_text(food_text)
+    return any(term in normalized_text for term in get_forbidden_food_terms())
+
+
+def clean_food_location_text(location_text: str) -> str:
+    """clean_food_location_text：清理美食地址，避免出现“位置：位置：”等重复字段。"""
+
+    # cleaned_location：去掉常见字段前缀后的地址文本。
+    cleaned_location = clean_markdown_text(location_text)
+    cleaned_location = re.sub(r"^(?:📍\s*)?(?:位置|地址)\s*[：:]\s*", "", cleaned_location)
+    cleaned_location = re.sub(r"^(?:位置|地址)\s*[：:]\s*", "", cleaned_location)
+    return cleaned_location.strip(" ，,。")
+
+
+def infer_food_destination(food_item: dict, parsed_request: dict) -> str:
+    """infer_food_destination：为美食卡片推断所属目的地。"""
+
+    # destinations：系统识别出的全部目的地。
+    destinations = parsed_request.get("destinations") or [parsed_request["destination"]]
+
+    # explicit_destination：模型直接返回的目的地字段。
+    explicit_destination = clean_markdown_text(str(food_item.get("destination", "")))
+    if explicit_destination:
+        return explicit_destination
+
+    if len(destinations) == 1:
+        return destinations[0]
+
+    # combined_text：从标题、地址、搜索词里匹配目的地。
+    combined_text = " ".join(
+        str(food_item.get(field_name, ""))
+        for field_name in ["name_cn", "name_original", "location", "map_keyword", "title"]
+    )
+    for destination in destinations:
+        if destination and destination in combined_text:
+            return destination
+
+    return ""
+
+
+def make_food_card(
+    destination: str,
+    name_cn: str,
+    name_original: str,
+    location: str,
+    recommended_dishes: str,
+    budget: str,
+    reason: str,
+    booking_note: str,
+    map_keyword: str,
+) -> dict:
+    """make_food_card：创建统一的美食推荐卡片数据。"""
+
+    return {
+        "destination": clean_markdown_text(destination),
+        "title": clean_markdown_text(name_cn),
+        "name_original": clean_markdown_text(name_original),
+        "location": clean_food_location_text(location),
+        "recommended_dishes": clean_markdown_text(recommended_dishes),
+        "budget": clean_markdown_text(budget),
+        "reason": clean_markdown_text(reason),
+        "booking_note": clean_markdown_text(booking_note),
+        "map_keyword": clean_markdown_text(map_keyword),
+    }
+
+
+def get_food_illustration_class(food: dict) -> str:
+    """get_food_illustration_class：根据美食名称和推荐菜选择轻量插画类型。"""
+
+    # food_text：用于判断美食类型的组合文本，只影响页面装饰。
+    food_text = " ".join(
+        str(food.get(field_name, ""))
+        for field_name in ["title", "name_original", "recommended_dishes", "reason", "map_keyword"]
+    )
+    food_text_lower = food_text.lower()
+
+    # dessert_keywords：甜品、蛋挞、冰淇淋等用甜品插画。
+    dessert_keywords = ["蛋挞", "甜品", "冰淇淋", "雪糕", "奶茶", "咖啡", "布丁", "糖", "糕", "饼", "tart", "dessert", "ice cream"]
+    if any(keyword.lower() in food_text_lower for keyword in dessert_keywords):
+        return "dessert"
+
+    # bakery_keywords：猪扒包、面包、汉堡等用烘焙/面包插画。
+    bakery_keywords = ["猪扒包", "面包", "汉堡", "三明治", "包", "burger", "bun", "sandwich"]
+    if any(keyword.lower() in food_text_lower for keyword in bakery_keywords):
+        return "bakery"
+
+    # cutlery_keywords：餐厅、酒楼、主食类用餐具插画。
+    cutlery_keywords = ["餐厅", "酒楼", "饭店", "茶餐厅", "bistro", "restaurant", "cafe"]
+    if any(keyword.lower() in food_text_lower for keyword in cutlery_keywords):
+        return "cutlery"
+
+    return "bowl"
+
+
+def get_fallback_food_cards_for_destination(destination: str) -> list[dict]:
+    """get_fallback_food_cards_for_destination：为常见测试目的地提供明确可搜索的美食区域兜底。"""
+
+    # fallback_map：常见目的地的具体店铺或美食区域，营业状态请以地图 App 为准。
+    fallback_map = {
+        "深圳": [
+            make_food_card("深圳", "八合里牛肉火锅", "Baheli Beef Hot Pot", "深圳福田、南山等商圈多店，建议地图确认最近门店", "潮汕牛肉火锅、手打牛肉丸", "人均 100-180 元", "深圳常见高人气潮汕牛肉火锅选择，适合正式晚餐。", "热门晚餐时段可能排队，建议提前取号。", "深圳 八合里牛肉火锅"),
+            make_food_card("深圳", "东门町美食街", "Dongmen Food Street", "深圳罗湖区东门老街商圈", "肠粉、茶餐厅小吃、街边小食", "人均 30-80 元", "老牌商业街区，适合集中尝试深圳街头小吃。", "周末人流较多，注意保管随身物品。", "深圳 东门町 美食街"),
+            make_food_card("深圳", "海岸城餐饮商圈", "Coastal City / 海岸城", "深圳南山区文心五路海岸城附近", "粤菜、茶餐厅、火锅、创意餐厅", "人均 80-200 元", "南山成熟餐饮商圈，选择多，适合和深圳湾、人才公园行程搭配。", "热门餐厅建议提前线上取号。", "深圳 南山 海岸城 餐厅"),
+            make_food_card("深圳", "蛇口海上世界餐饮区", "Sea World Shekou", "深圳南山区蛇口海上世界片区", "海鲜、异国料理、酒吧餐厅", "人均 100-260 元", "夜景和餐饮集中，适合晚上慢逛和用餐。", "夜间客流较多，建议错峰前往。", "深圳 蛇口海上世界 餐厅"),
+        ],
+        "香港": [
+            make_food_card("香港", "九记牛腩", "Kau Kee Restaurant / 九記牛腩", "香港中环歌赋街21号", "清汤牛腩、咖喱牛筋腩", "人均 80-150 港币", "香港经典牛腩店，游客和本地人都常去。", "热门时段可能排队，建议错峰前往并以地图营业时间为准。", "香港 九记牛腩 中环"),
+            make_food_card("香港", "一乐烧鹅", "Yat Lok Restaurant / 一樂燒鵝", "香港中环士丹利街34-38号附近", "烧鹅饭、烧鹅濑粉", "人均 80-180 港币", "中环人气烧鹅店，适合想体验港式烧味的游客。", "午晚餐高峰可能排队，建议提前查营业时间。", "香港 一乐烧鹅 中环"),
+            make_food_card("香港", "澳洲牛奶公司", "Australia Dairy Company / 澳洲牛奶公司", "香港佐敦白加士街47-49号附近", "炒蛋多士、炖奶、通粉", "人均 50-100 港币", "经典港式茶餐厅，翻台快，适合早餐或下午轻食。", "服务节奏快，建议提前想好点单。", "香港 澳洲牛奶公司 佐敦"),
+            make_food_card("香港", "兰芳园", "Lan Fong Yuen / 蘭芳園", "香港中环结志街2号附近", "丝袜奶茶、猪扒包、捞丁", "人均 50-120 港币", "老牌港式茶餐厅，适合体验香港茶餐厅风味。", "分店较多，请以地图 App 确认最近门店。", "香港 兰芳园 中环"),
+        ],
+        "南京": [
+            make_food_card("南京", "李记清真馆", "Li Ji Halal Restaurant / 李记清真馆", "南京秦淮区评事街附近", "牛肉锅贴、牛肉汤", "人均 30-70 元", "南京老牌小吃选择，适合体验本地清真风味。", "饭点可能排队，建议错峰。", "南京 李记清真馆 评事街"),
+            make_food_card("南京", "老门东美食街区", "Laomendong Food Area / 老门东", "南京秦淮区老门东历史街区", "鸭血粉丝汤、梅花糕、小笼包", "人均 40-120 元", "小吃和餐厅集中，适合一次性尝试南京特色。", "节假日人流大，建议避开正餐高峰。", "南京 老门东 美食"),
+            make_food_card("南京", "南京大牌档", "Nanjing Impressions / 南京大牌档", "南京新街口、夫子庙等商圈多店", "盐水鸭、民国美龄粥、烤鸭包", "人均 80-150 元", "南京菜代表性连锁，菜品稳定，适合第一次到南京。", "热门门店建议提前取号。", "南京大牌档 新街口 夫子庙"),
+            make_food_card("南京", "夫子庙秦淮小吃区", "Confucius Temple Food Area / 夫子庙", "南京秦淮区夫子庙步行街周边", "鸭血粉丝汤、汤包、赤豆元宵", "人均 40-100 元", "靠近秦淮河夜景，适合晚间边逛边吃。", "游客较多，建议优先选择评分稳定的店。", "南京 夫子庙 秦淮小吃"),
+        ],
+        "江西": [
+            make_food_card("江西", "南昌万寿宫历史文化街区", "Wanshou Palace Historical Block / 万寿宫", "南昌市中山路万寿宫历史文化街区", "南昌拌粉、瓦罐汤、白糖糕", "人均 30-90 元", "南昌小吃集中区域，适合作为江西段第一站美食体验。", "周末夜间人流多，建议错峰。", "南昌 万寿宫 拌粉 瓦罐汤"),
+            make_food_card("江西", "南昌绳金塔美食街", "Shengjin Tower Food Street / 绳金塔", "南昌市西湖区绳金塔周边", "拌粉、瓦罐汤、烧烤、小吃", "人均 40-100 元", "夜间餐饮选择多，适合体验南昌烟火气。", "夜市类区域请注意营业时间变化。", "南昌 绳金塔 美食街"),
+            make_food_card("江西", "景德镇抚州弄小吃街", "Fuzhou Alley / 抚州弄", "景德镇珠山区抚州弄附近", "冷粉、饺子粑、油条包麻糍", "人均 25-70 元", "景德镇本地小吃集中，适合陶溪川或老城行程后前往。", "小店营业时间变化较快，请以地图 App 为准。", "景德镇 抚州弄 小吃"),
+            make_food_card("江西", "婺源篁岭小吃区域", "Huangling Food Area / 篁岭", "上饶市婺源县篁岭景区及周边", "汽糕、糊豆腐、粉蒸菜", "人均 40-120 元", "适合婺源乡村风景路线中补充地方小吃。", "景区餐饮价格和营业时间请出行前确认。", "婺源 篁岭 小吃"),
+            make_food_card("江西", "庐山牯岭街餐饮区", "Guling Street / 牯岭街", "九江市庐山市牯岭街周边", "庐山石耳、石鱼、江西家常菜", "人均 60-150 元", "庐山住宿和餐饮集中区域，适合山上行程用餐。", "山上天气变化快，晚餐建议提前安排。", "庐山 牯岭街 餐厅"),
+        ],
+    }
+
+    return list(fallback_map.get(destination, []))
+
+
+def ensure_food_cards_per_destination(food_cards: list[dict], parsed_request: dict) -> list[dict]:
+    """ensure_food_cards_per_destination：按目的地补足具体美食推荐，不生成空卡片。"""
+
+    # destinations：系统识别出的目的地列表。
+    destinations = parsed_request.get("destinations") or [parsed_request["destination"]]
+
+    # result_cards：过滤后的美食卡片。
+    result_cards = []
+    seen_titles = set()
+    for food_card in food_cards:
+        card_text = " ".join(str(value) for value in food_card.values())
+        if contains_forbidden_food_term(card_text):
+            continue
+        if not food_card.get("title") or not food_card.get("location"):
+            continue
+        title_key = f"{food_card.get('destination', '')}|{food_card['title']}"
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        result_cards.append(food_card)
+
+    for destination in destinations:
+        # current_count：当前目的地已有卡片数量。
+        current_count = sum(1 for card in result_cards if card.get("destination") == destination)
+        if current_count >= 4:
+            continue
+
+        for fallback_card in get_fallback_food_cards_for_destination(destination):
+            title_key = f"{fallback_card.get('destination', '')}|{fallback_card['title']}"
+            if title_key in seen_titles:
+                continue
+            result_cards.append(fallback_card)
+            seen_titles.add(title_key)
+            current_count += 1
+            if current_count >= 4:
+                break
+
+    return result_cards
+
+
+def is_markdown_table_separator(line_text: str) -> bool:
+    """is_markdown_table_separator：判断是否为 Markdown 表格分隔线。"""
+
+    # normalized_text：去掉空格后的表格行文本。
+    normalized_text = line_text.strip().replace(" ", "")
+    if not normalized_text:
+        return False
+
+    return bool(re.fullmatch(r"\|?[:\-|]+\|?", normalized_text))
+
+
+def is_budget_noise_line(line_text: str) -> bool:
+    """is_budget_noise_line：过滤预算区域中的空行、表头、分隔线和无意义符号行。"""
+
+    # cleaned_line：清理后的单行文本。
+    cleaned_line = clean_markdown_text(line_text).strip()
+    if not cleaned_line:
+        return True
+
+    if is_markdown_table_separator(line_text):
+        return True
+
+    # symbol_only：只包含 Markdown 表格符号或横线的行。
+    symbol_only = re.sub(r"[\s\|:\-—–]+", "", line_text.strip())
+    if not symbol_only:
+        return True
+
+    # table_header_words：常见预算表头字段。
+    table_header_words = ["项目", "预算", "说明", "费用", "金额", "备注"]
+    if "|" in line_text:
+        table_cells = [cell.strip() for cell in line_text.strip().strip("|").split("|")]
+        normalized_cells = [re.sub(r"\s+", "", cell) for cell in table_cells if cell.strip()]
+        if normalized_cells and all(any(word in cell for word in table_header_words) for cell in normalized_cells):
+            return True
+
+    return False
+
+
+def parse_budget_table_rows(section_text: str) -> list[dict]:
+    """parse_budget_table_rows：优先把 Markdown 表格解析成预算卡片数据。"""
+
+    def clean_budget_table_cell(cell_text: str) -> str:
+        """clean_budget_table_cell：清理预算表格单元格但保留数字金额。"""
+
+        return re.sub(r"[*`#]+", "", cell_text.strip()).strip()
+
+    # budget_items：解析后的预算项目。
+    budget_items = []
+    for line in section_text.splitlines():
+        stripped_line = line.strip()
+        if "|" not in stripped_line or is_budget_noise_line(stripped_line):
+            continue
+
+        # table_cells：表格单元格，过滤空单元。
+        table_cells = [clean_budget_table_cell(cell) for cell in stripped_line.strip().strip("|").split("|")]
+        table_cells = [cell for cell in table_cells if cell]
+        if len(table_cells) < 2:
+            continue
+
+        # title：预算项目名称。
+        title = table_cells[0]
+        if title in {"项目", "预算", "说明", "费用", "金额", "备注"}:
+            continue
+
+        # description_parts：预算金额和说明。
+        description_parts = table_cells[1:]
+        description = "；".join(description_parts)
+        if not description or is_budget_noise_line(description):
+            continue
+
+        budget_items.append({"title": title[:18], "description": description})
+
+    return budget_items
+
+
+def build_budget_items(section_text: str, max_items: int = 6) -> list[dict]:
+    """build_budget_items：解析预算估算内容，过滤 Markdown 表头和空卡片。"""
+
+    # table_items：优先解析 Markdown 表格。
+    table_items = parse_budget_table_rows(section_text)
+    if table_items:
+        return table_items[:max_items]
+
+    # raw_items：从列表或普通行提取出的候选预算项。
+    raw_items = extract_bullet_items(section_text, max_items=max_items * 2)
+
+    # budget_items：过滤后的预算卡片数据。
+    budget_items = []
+    for raw_item in raw_items:
+        if is_budget_noise_line(raw_item):
+            continue
+
+        # title/description：预算项标题和说明。
+        title = "预算项"
+        description = raw_item
+        if "：" in raw_item:
+            title, description = raw_item.split("：", 1)
+        elif ":" in raw_item:
+            title, description = raw_item.split(":", 1)
+
+        title = clean_markdown_text(title)[:18] or "预算项"
+        description = clean_markdown_text(description)
+        if not description or is_budget_noise_line(description):
+            continue
+
+        budget_items.append({"title": title, "description": description})
+
+    return budget_items[:max_items]
+
+
+def estimate_total_cost(parsed_request: dict) -> str:
+    """estimate_total_cost：根据天数和预算档位估算不含大交通的人均总花费。"""
+
+    if parsed_request.get("budget_has_explicit_amount"):
+        return f"按 {parsed_request['budget']} 控制"
+
+    # budget_level：用户预算档位。
+    budget_level = parsed_request.get("budget_level", parsed_request["budget"])
+
+    # days：旅行天数。
+    days = parsed_request["days"]
+
+    # nights：住宿晚数。
+    nights = parsed_request["nights"]
+
+    if budget_level == "经济预算":
+        day_cost, night_cost = 260, 320
+    elif budget_level == "高预算":
+        day_cost, night_cost = 980, 1600
+    else:
+        day_cost, night_cost = 480, 720
+
+    # low_cost：较低估算值。
+    low_cost = days * day_cost + nights * night_cost
+
+    # high_cost：较高估算值。
+    high_cost = int(low_cost * 1.35)
+
+    return f"约 {low_cost:,}-{high_cost:,} 人民币(CNY)/人"
+
+
+def infer_trip_pace(parsed_request: dict) -> str:
+    """infer_trip_pace：根据天数和偏好推断旅行节奏。"""
+
+    # preferences：用户偏好列表。
+    preferences = parsed_request["preferences"]
+
+    if parsed_request["days"] >= 6 or any(item in preferences for item in ["自然", "咖啡", "温泉", "海边"]):
+        return "松弛慢旅行"
+    if parsed_request["days"] <= 3 and any(item in preferences for item in ["购物", "夜景", "动漫"]):
+        return "高效城市探索"
+    return "舒适均衡节奏"
+
+
+def infer_audience(parsed_request: dict) -> str:
+    """infer_audience：根据偏好推断适合人群。"""
+
+    # preferences：用户偏好列表。
+    preferences = parsed_request["preferences"]
+
+    if "亲子" in preferences:
+        return "家庭与亲子出行"
+    if any(item in preferences for item in ["动漫", "购物", "夜景"]):
+        return "城市玩家与潮流爱好者"
+    if any(item in preferences for item in ["自然", "徒步", "海边"]):
+        return "自然风景和慢旅行人群"
+    return "第一次到访和自由行用户"
+
+
+def build_summary_metrics(parsed_request: dict) -> dict:
+    """build_summary_metrics：生成攻略摘要区需要展示的指标。"""
+
+    # preferences_count：偏好数量，用于生成推荐强度。
+    preferences_count = len(parsed_request["preferences"])
+
+    # recommendation_score：推荐强度评分。
+    recommendation_score = "4.9 / 5" if preferences_count >= 3 else "4.6 / 5"
+
+    return {
+        "推荐强度": recommendation_score,
+        "旅行节奏": infer_trip_pace(parsed_request),
+        "适合人群": infer_audience(parsed_request),
+        "预计总花费": estimate_total_cost(parsed_request),
+    }
+
+
+def extract_slot_text(day_text: str, slot_label: str) -> str:
+    """extract_slot_text：从某一天行程中提取上午、中午、下午或晚上的内容。"""
+
+    # slot_pattern：匹配指定时间段的 Markdown 行。
+    slot_pattern = rf"(?:^|\n)\s*[-*]?\s*(?:\*\*)?{slot_label}(?:\*\*)?\s*[：:]\s*(.+)"
+    match = re.search(slot_pattern, day_text)
+    if match:
+        return clean_markdown_text(match.group(1))
+    return ""
+
+
+def get_timeline_slot_config() -> list[dict]:
+    """get_timeline_slot_config: return the four fixed timeline periods."""
+
+    return [
+        {"key": "morning", "label": "上午", "icon": "上午", "time": "", "aliases": ["morning", "上午", "早上"]},
+        {"key": "noon", "label": "中午", "icon": "中午", "time": "", "aliases": ["noon", "中午", "午餐", "lunch"]},
+        {"key": "afternoon", "label": "下午", "icon": "下午", "time": "", "aliases": ["afternoon", "下午"]},
+        {"key": "evening", "label": "晚上", "icon": "晚上", "time": "", "aliases": ["evening", "晚上", "夜晚", "night"]},
+    ]
+
+def get_first_text_value(source_data: dict, field_aliases: list[str]) -> str:
+    """get_first_text_value：从多个可能字段名中取第一个非空文本。"""
+
+    for field_name in field_aliases:
+        # field_value：当前候选字段值。
+        field_value = source_data.get(field_name)
+        if field_value is not None and str(field_value).strip():
+            return clean_markdown_text(str(field_value))
+    return ""
+
+
+def get_first_raw_text_value(source_data: dict, field_aliases: list[str]) -> str:
+    """get_first_raw_text_value：读取不应经过 Markdown 清洗的原始文本，例如时间字段。"""
+
+    for field_name in field_aliases:
+        field_value = source_data.get(field_name)
+        if field_value is not None and str(field_value).strip():
+            return str(field_value).strip()
+    return ""
+
+
+def normalize_timeline_slot(slot_data: object, slot_config: dict) -> dict:
+    """normalize_timeline_slot：把不同结构的时间段数据标准化为页面时间线字段。"""
+
+    # slot_label/default_time：时间段展示标签和默认时间。
+    slot_label = slot_config["label"]
+    default_time = slot_config["time"]
+
+    if isinstance(slot_data, dict):
+        # time_text/place_text/...：兼容英文、中文和模型常见别名。
+        time_text = get_first_raw_text_value(slot_data, ["time", "时间", "period", "time_range", "时段"])
+        place_text = get_first_text_value(slot_data, ["place", "地点", "location", "spot", "name", "title", "安排"])
+        original_name = get_first_text_value(slot_data, ["original_name", "原名", "英文名", "local_name", "name_original", "english_name"])
+        reason_text = get_first_text_value(slot_data, ["reason", "推荐理由", "description", "说明", "activity", "details"])
+        duration_text = get_first_text_value(slot_data, ["duration", "预计耗时", "耗时", "time_spent"])
+        transport_text = get_first_text_value(slot_data, ["transport", "交通", "交通建议", "traffic", "route"])
+        booking_note = get_first_text_value(slot_data, ["booking_note", "预约提醒", "注意事项", "note", "tips", "提醒"])
+    elif isinstance(slot_data, str):
+        # slot_text：Markdown 或字符串行程内容。
+        slot_text = clean_markdown_text(slot_data)
+        slot_parts = [part.strip() for part in re.split(r"[｜|]", slot_text) if part.strip()]
+        place_text = slot_parts[0] if slot_parts else ""
+        reason_text = slot_parts[1] if len(slot_parts) > 1 else (slot_text if slot_text else "")
+        duration_text = slot_parts[2] if len(slot_parts) > 2 else ""
+        transport_text = slot_parts[3] if len(slot_parts) > 3 else ""
+        time_text = ""
+        original_name = place_text
+        booking_note = "建议出行前再次确认。"
+    else:
+        time_text = ""
+        place_text = ""
+        original_name = ""
+        reason_text = ""
+        duration_text = ""
+        transport_text = ""
+        booking_note = ""
+
+    # safe_place：缺少地点时不编造地点，只提示信息不足。
+    safe_place = place_text or f"{slot_label}安排待确认"
+    safe_reason = reason_text or "部分时间段信息不足，建议出行前再次确认。"
+    safe_time = clean_time_range(time_text, slot_label)
+    safe_duration = clean_duration(duration_text)
+    safe_transport = transport_text or "交通方式请结合当天位置确认。"
+    safe_booking_note = booking_note or "建议出行前再次确认。"
+
+    return {
+        "label": slot_label,
+        "time": safe_time,
+        "icon": slot_config["icon"],
+        "place": safe_place,
+        "description": safe_reason,
+        "original_name": original_name or safe_place,
+        "reason": safe_reason,
+        "duration": safe_duration,
+        "transport": safe_transport,
+        "booking_note": safe_booking_note,
+        "is_incomplete": not all([place_text, reason_text, safe_duration, transport_text, booking_note]),
+    }
+
+
+def find_slot_data(day_item: dict, slot_config: dict) -> object:
+    """find_slot_data：从不同字段结构中查找某个时间段的行程数据。"""
+
+    # direct_aliases：直接挂在 day_item 下的时间段字段名。
+    direct_aliases = slot_config["aliases"]
+    for alias in direct_aliases:
+        if alias in day_item:
+            return day_item.get(alias)
+
+    # nested_keys：模型可能使用的嵌套行程字段。
+    nested_keys = ["time_slots", "schedule", "itinerary", "slots", "安排"]
+    for nested_key in nested_keys:
+        nested_data = day_item.get(nested_key)
+        if isinstance(nested_data, dict):
+            for alias in direct_aliases:
+                if alias in nested_data:
+                    return nested_data.get(alias)
+        elif isinstance(nested_data, list):
+            for nested_item in nested_data:
+                if not isinstance(nested_item, dict):
+                    continue
+                # slot_name：列表项里的时段名称。
+                slot_name = get_first_text_value(nested_item, ["slot", "period", "label", "time_of_day", "时段", "时间段"])
+                if any(alias.lower() in slot_name.lower() for alias in direct_aliases if alias):
+                    return nested_item
+
+    return None
+
+
+def get_day_list_from_travel_json(travel_json: dict | None) -> list:
+    """get_day_list_from_travel_json：从不同 JSON 字段中提取每日行程列表。"""
+
+    if not isinstance(travel_json, dict):
+        return []
+
+    # candidate_keys：可能承载每日行程的顶层字段。
+    candidate_keys = ["daily_itinerary", "itinerary", "schedule", "days", "day_plans"]
+    for candidate_key in candidate_keys:
+        candidate_value = travel_json.get(candidate_key)
+        if isinstance(candidate_value, list):
+            return candidate_value
+        if isinstance(candidate_value, dict):
+            for nested_key in ["daily_itinerary", "days", "items", "schedule", "itinerary"]:
+                nested_value = candidate_value.get(nested_key)
+                if isinstance(nested_value, list):
+                    return nested_value
+
+    return []
+
+
+def infer_segment_destination_for_day(day_number: int, parsed_request: dict) -> str:
+    """infer_segment_destination_for_day：按分段天数推断某一天所属目的地。"""
+
+    # current_day：当前分段累计到的最后一天。
+    current_day = 0
+    for segment in parsed_request.get("trip_segments", []):
+        current_day += int(segment.get("days", 0) or 0)
+        if day_number <= current_day:
+            return str(segment.get("destination", parsed_request["destination"]))
+    return parsed_request["destination"]
+
+
+def normalize_daily_itinerary(travel_json: dict | None, parsed_request: dict) -> tuple[list[dict], list[str]]:
+    """normalize_daily_itinerary：把模型返回的每日行程标准化为可渲染时间线。"""
+
+    # day_list：从 JSON 中提取出的每日行程列表。
+    day_list = get_day_list_from_travel_json(travel_json)
+    if not day_list:
+        return [], ["本次行程细节不完整，请尝试重新生成。"]
+
+    # slot_config_list：四个时间段配置。
+    slot_config_list = get_timeline_slot_config()
+
+    # timeline_days/render_notes：最终时间线和普通提示。
+    timeline_days = []
+    render_notes = []
+    for index, day_item in enumerate(day_list, start=1):
+        if not isinstance(day_item, dict):
+            continue
+
+        # day_number：兼容数字和中文数字。
+        raw_day_number = day_item.get("day") or day_item.get("Day") or day_item.get("日期") or index
+        try:
+            day_number = int(raw_day_number)
+        except (TypeError, ValueError):
+            day_number = parse_chinese_number(str(raw_day_number)) or index
+
+        # segment_destination：多目的地时展示当前日期所属目的地。
+        segment_destination = (
+            str(day_item.get("segment_destination") or day_item.get("destination") or day_item.get("目的地") or "").strip()
+            or infer_segment_destination_for_day(day_number, parsed_request)
+        )
+
+        # theme：当天主题。
+        theme = clean_user_facing_text(
+            str(day_item.get("theme") or day_item.get("主题") or day_item.get("title") or f"{segment_destination}自由探索")
+        )
+        title_prefix = f"{segment_destination}｜" if segment_destination else ""
+
+        # slot_list：单日时间段列表，缺字段时继续渲染友好提示。
+        slot_list = []
+        for slot_config in slot_config_list:
+            normalized_slot = normalize_timeline_slot(find_slot_data(day_item, slot_config), slot_config)
+            if normalized_slot.get("is_incomplete"):
+                render_notes.append(f"Day {day_number} {slot_config['label']}部分信息不足")
+            slot_list.append(normalized_slot)
+
+        timeline_days.append({"title": f"Day {day_number}：{title_prefix}{theme}", "slots": slot_list})
+
+    if not timeline_days:
+        return [], ["本次行程细节不完整，请尝试重新生成。"]
+
+    return timeline_days, render_notes
+
+
+def build_timeline_days(section_map: dict, parsed_request: dict) -> tuple[list[dict], list[str]]:
+    """build_timeline_days：把每日行程 Markdown 转成时间线数据。"""
+
+    # itinerary_text：每日行程 Markdown 内容。
+    itinerary_text = section_map.get("每日行程", "").strip()
+    if not itinerary_text:
+        return [], ["未找到“每日行程”区域。"]
+
+    # timeline_markdown：补回二级标题，复用统一的 Day 块解析函数。
+    timeline_markdown = f"## 每日行程\n{itinerary_text}"
+
+    # day_blocks：从 Markdown 中解析出的每日行程块。
+    day_blocks = parse_itinerary_day_blocks(timeline_markdown)
+
+    if not day_blocks:
+        return [], ["本次行程细节不完整，请尝试重新生成。"]
+
+    # slot_config：时间线四个固定时段。
+    slot_config = get_timeline_slot_config()
+
+    # timeline_days/render_notes：最终时间线数据和友好提示。
+    timeline_days = []
+    render_notes = []
+    for day_block in day_blocks:
+        day_number = day_block["day"]
+        # slot_list：单日四个时间段的数据。
+        slot_list = []
+        for slot in slot_config:
+            slot_text = extract_slot_text(day_block["body"], slot["label"])
+            if not slot_text:
+                render_notes.append(f"Day {day_number} {slot['label']}部分信息不足")
+            slot_list.append(normalize_timeline_slot(slot_text or None, slot))
+
+        timeline_days.append({"title": f"Day {day_number}：{day_block['theme']}", "slots": slot_list})
+
+    return timeline_days, render_notes
+
+
+def build_timeline_days_from_json(travel_json: dict | None, parsed_request: dict) -> tuple[list[dict], list[str]]:
+    """build_timeline_days_from_json：把结构化 JSON 转成时间线卡片数据。"""
+    return normalize_daily_itinerary(travel_json, parsed_request)
+
+
+def build_food_cards(section_map: dict, parsed_request: dict) -> list[dict]:
+    """build_food_cards：把美食推荐 Markdown 转成美食卡片数据。"""
+
+    # food_items：美食推荐列表。
+    food_items = extract_bullet_items(section_map.get("美食推荐", ""), max_items=24)
+
+    # food_cards：最终美食卡片数据。
+    food_cards = []
+    for item in food_items:
+        if contains_forbidden_food_term(item):
+            continue
+
+        title = item
+        detail = ""
+        if "：" in item:
+            title, detail = item.split("：", 1)
+        elif ":" in item:
+            title, detail = item.split(":", 1)
+
+        if contains_forbidden_food_term(title) or not clean_markdown_text(title):
+            continue
+
+        # detail_parts：按竖线拆出的理由、预算和场景。
+        detail_parts = [part.strip() for part in re.split(r"[｜|]", detail) if part.strip()]
+
+        # location_match/recommend_match/budget_match/booking_match：从 Markdown 详情中提取结构化字段。
+        location_match = re.search(r"(?:地址|位置)\s*[：:]\s*([^｜|。；;\n]+)", detail)
+        recommend_match = re.search(r"(?:推荐|推荐菜|吃什么)\s*[：:]\s*([^｜|。；;\n]+)", detail)
+        budget_match = re.search(r"(?:人均|预算)\s*[：:]\s*([^｜|。；;\n]+)", detail)
+        booking_match = re.search(r"(?:提醒|预约|排队)\s*[：:]\s*([^｜|\n]+)", detail)
+
+        # title_text：店铺或美食区域名称。
+        title_text = clean_markdown_text(title)[:42]
+        food_item = {
+            "name_cn": title_text,
+            "name_original": "",
+            "location": location_match.group(1).strip() if location_match else "地址请以地图 App 最新结果为准",
+            "recommended_dishes": recommend_match.group(1).strip() if recommend_match else (detail_parts[0] if detail_parts else "推荐菜请以菜单为准"),
+            "reason": detail_parts[0] if detail_parts else "该美食点适合作为当地风味参考。",
+            "budget": budget_match.group(1).strip() if budget_match else (detail_parts[1] if len(detail_parts) > 1 else "人均预算待确认"),
+            "booking_note": booking_match.group(1).strip() if booking_match else "热门时段可能排队，建议出行前查看地图评价和营业时间。",
+            "map_keyword": title_text,
+        }
+        destination = infer_food_destination(food_item, parsed_request) or (
+            parsed_request.get("destinations") or [parsed_request["destination"]]
+        )[0]
+
+        food_cards.append(
+            make_food_card(
+                destination,
+                food_item["name_cn"],
+                food_item["name_original"],
+                food_item["location"],
+                food_item["recommended_dishes"],
+                food_item["budget"],
+                food_item["reason"],
+                food_item["booking_note"],
+                food_item["map_keyword"],
+            )
+        )
+
+    return ensure_food_cards_per_destination(food_cards, parsed_request)
+
+
+def build_food_cards_from_json(travel_json: dict | None, parsed_request: dict) -> list[dict]:
+    """build_food_cards_from_json：把结构化 JSON 中的美食推荐转成卡片数据。"""
+
+    if not isinstance(travel_json, dict):
+        return []
+
+    # food_recommendations：结构化 JSON 中的美食推荐列表。
+    food_recommendations = travel_json.get("food_recommendations", [])
+    if not isinstance(food_recommendations, list):
+        return []
+
+    # normalized_food_items：兼容扁平列表和按 destination/items 分组的美食结构。
+    normalized_food_items = []
+    for raw_food_item in food_recommendations:
+        if not isinstance(raw_food_item, dict):
+            continue
+        grouped_items = raw_food_item.get("items") or raw_food_item.get("foods") or raw_food_item.get("restaurants")
+        if isinstance(grouped_items, list):
+            group_destination = raw_food_item.get("destination")
+            for grouped_food in grouped_items:
+                if isinstance(grouped_food, dict):
+                    normalized_food = dict(grouped_food)
+                    normalized_food.setdefault("destination", group_destination)
+                    normalized_food_items.append(normalized_food)
+            continue
+        normalized_food_items.append(raw_food_item)
+
+    # food_cards：最终美食卡片数据。
+    food_cards = []
+    for food_item in normalized_food_items:
+        if not isinstance(food_item, dict):
+            continue
+
+        # name_cn/name_original：店铺中文名与英文/当地原名。
+        name_cn = clean_markdown_text(str(food_item.get("name_cn", "")))
+        name_original = clean_markdown_text(str(food_item.get("name_original", "")))
+        if not name_cn or contains_forbidden_food_term(name_cn):
+            continue
+
+        # destination：美食所属目的地，渲染前按城市分组。
+        destination = infer_food_destination(food_item, parsed_request)
+
+        # recommended_dishes：推荐菜字段，兼容旧字段 scene/nearby_spot 但过滤占位词。
+        recommended_dishes = clean_markdown_text(
+            str(food_item.get("recommended_dishes") or food_item.get("dishes") or food_item.get("recommend") or "")
+        )
+        if not recommended_dishes or contains_forbidden_food_term(recommended_dishes):
+            recommended_dishes = "推荐菜请以店内菜单和地图评价为准"
+
+        food_cards.append(
+            make_food_card(
+                destination,
+                name_cn,
+                name_original,
+                clean_food_location_text(str(food_item.get("location", ""))) or "地址请以地图 App 最新结果为准",
+                recommended_dishes,
+                clean_markdown_text(str(food_item.get("budget", ""))) or "人均预算待确认",
+                clean_markdown_text(str(food_item.get("reason", ""))) or "该美食点适合作为当地风味参考。",
+                clean_markdown_text(str(food_item.get("booking_note", ""))) or "热门时段可能排队，建议提前查看营业时间。",
+                clean_markdown_text(str(food_item.get("map_keyword", ""))) or f"{destination} {name_cn}".strip(),
+            )
+        )
+
+    return ensure_food_cards_per_destination(food_cards, parsed_request)
+
+
+def build_advice_cards(
+    section_text: str,
+    fallback_items: list[str],
+    max_items: int = 4,
+    default_title: str = "提醒",
+) -> list[dict]:
+    """build_advice_cards：把交通建议或避坑提醒转成卡片数据。"""
+
+    # advice_items：从 Markdown 中提取出的建议列表。
+    advice_items = extract_bullet_items(section_text, max_items=max_items * 2) or fallback_items
+
+    # advice_cards：最终建议卡片数据。
+    advice_cards = []
+    for item in advice_items:
+        item_text = clean_user_facing_text(item)
+        if not is_meaningful_text(item_text):
+            continue
+
+        title = default_title
+        description = item_text
+        if "：" in item and len(item.split("：", 1)[0]) <= 16:
+            title, description = item.split("：", 1)
+        elif ":" in item and len(item.split(":", 1)[0]) <= 16:
+            title, description = item.split(":", 1)
+        else:
+            title = clean_user_facing_text(item_text) or default_title
+            description = ""
+
+        title = clean_user_facing_text(title)
+        description = clean_user_facing_text(description)
+
+        if not is_meaningful_text(title):
+            continue
+        if description and title == description:
+            description = ""
+        if description and title and title == description and len(description) <= 8 and not re.search(
+            r"建议|优先|确认|选择|使用|减少|避免|提前|注意|预留|打车|地铁|公交|高铁|步行|换乘|出发|到达",
+            description,
+        ):
+            continue
+
+        advice_cards.append({"title": title, "description": description})
+        if len(advice_cards) >= max_items:
+            break
+
+    return advice_cards
+
+
+def translate_destination_name_roughly(name: str) -> str:
+    """translate_destination_name_roughly：把常见中文目的地转换成 Hero 使用的英文名。"""
+
+    # cleaned_name：清理后的目的地名称。
+    cleaned_name = str(name or "").strip()
+    if not cleaned_name:
+        return ""
+
+    return HERO_DESTINATION_ENGLISH_MAP.get(cleaned_name, cleaned_name)
+
+
+def get_trip_total_days(parsed_trip: dict | None) -> int:
+    """get_trip_total_days：从解析结果中获取总天数，缺失时按分段累加。"""
+
+    if not parsed_trip:
+        return DEFAULT_TRAVEL_DAYS
+
+    for field_name in ["total_days", "days"]:
+        try:
+            days_value = int(parsed_trip.get(field_name, 0) or 0)
+            if days_value > 0:
+                return days_value
+        except (TypeError, ValueError):
+            continue
+
+    # total_days：如果顶层天数字段缺失，则从 trip_segments 累加。
+    total_days = 0
+    for segment in parsed_trip.get("trip_segments", []) or []:
+        try:
+            total_days += int(segment.get("days", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+
+    return total_days or DEFAULT_TRAVEL_DAYS
+
+
+def get_destination_display_title(parsed_trip: dict | None) -> str:
+    """get_destination_display_title：生成 Hero 杂志卡片中的英文目的地标题。"""
+
+    if not parsed_trip:
+        return "Your Next Trip"
+
+    # destinations：优先使用结构化目的地列表，缺失时再拆分 destination 文本。
+    destinations = [str(item).strip() for item in parsed_trip.get("destinations", []) if str(item).strip()]
+    if not destinations:
+        destination_text = str(parsed_trip.get("destination", "")).strip()
+        destinations = [
+            item.strip()
+            for item in re.split(r"\s*[×xX+、,，/]\s*", destination_text)
+            if item.strip()
+        ]
+
+    # translated_names：去重后的英文目的地名称。
+    translated_names = []
+    seen_names = set()
+    for destination in destinations:
+        translated_name = translate_destination_name_roughly(destination)
+        if translated_name and translated_name not in seen_names:
+            translated_names.append(translated_name)
+            seen_names.add(translated_name)
+
+    if not translated_names:
+        return "Your Next Trip"
+
+    if len(translated_names) <= 3:
+        return " × ".join(translated_names)
+
+    return f"{translated_names[0]} × {translated_names[1]} + {len(translated_names) - 2} Destinations"
+
+
+def get_hero_journey_days_text(parsed_trip: dict | None) -> str:
+    """get_hero_journey_days_text：生成 Hero 杂志卡片中的英文天数文案。"""
+
+    return f"{get_trip_total_days(parsed_trip)} Days Journey"
+
+
+def infer_hero_cover_theme(parsed_trip: dict | None) -> str:
+    """infer_hero_cover_theme：根据目的地和偏好选择 Hero 卡片装饰主题。"""
+
+    if not parsed_trip:
+        return "travel"
+
+    # theme_signal：用于判断视觉主题的目的地和偏好合并文本。
+    theme_signal = " ".join(
+        [str(parsed_trip.get("destination", ""))]
+        + [str(item) for item in parsed_trip.get("destinations", [])]
+        + [str(item) for item in parsed_trip.get("preferences", [])]
+    )
+
+    if re.search(r"拍照|摄影|打卡|小红书|情侣", theme_signal):
+        return "photo"
+    if re.search(r"海边|海岛|沙滩|三亚|厦门|青岛|冲绳|普吉|巴厘", theme_signal):
+        return "sea"
+    if re.search(r"历史|文化|古城|博物馆|寺|庙|京都|南京|西安|北京", theme_signal):
+        return "history"
+    if re.search(r"夜景|城市|香港|深圳|上海|重庆|首尔|东京", theme_signal):
+        return "night"
+    if re.search(r"美食|小吃|餐厅|咖啡|夜市", theme_signal):
+        return "food"
+
+    return "travel"
+
+
+def get_hero_preview_trip(namespace: str = TRAVEL_INPUT_NAMESPACE) -> dict:
+    """get_hero_preview_trip：从当前输入框状态生成 Hero 预览用旅行参数。"""
+
+    # textarea_key：当前输入框组件 key。
+    textarea_key = get_travel_textarea_key(namespace)
+
+    # current_input：用户已输入或点击示例后保存的一句话旅行需求。
+    current_input = (
+        st.session_state.get(textarea_key)
+        or st.session_state.get(TRAVEL_INPUT_STATE_KEY)
+        or st.session_state.get("travel_request_input")
+        or ""
+    )
+
+    if not str(current_input).strip():
+        return {
+            "destination": "Your Next Trip",
+            "destinations": [],
+            "days": DEFAULT_TRAVEL_DAYS,
+            "total_days": DEFAULT_TRAVEL_DAYS,
+            "preferences": [],
+            "trip_segments": [],
+        }
+
+    try:
+        return parse_travel_request(str(current_input))
+    except Exception:
+        return {
+            "destination": "Your Next Trip",
+            "destinations": [],
+            "days": DEFAULT_TRAVEL_DAYS,
+            "total_days": DEFAULT_TRAVEL_DAYS,
+            "preferences": [],
+            "trip_segments": [],
+        }
+
+
+def render_hero(namespace: str = TRAVEL_INPUT_NAMESPACE) -> None:
+    """render_hero：渲染页面顶部的产品标题区。"""
+
+    # preview_trip：Hero 右侧旅行杂志卡片使用的动态预览参数。
+    preview_trip = get_hero_preview_trip(namespace)
+    destination_title = html.escape(get_destination_display_title(preview_trip))
+    journey_days_text = html.escape(get_hero_journey_days_text(preview_trip))
+    cover_theme = html.escape(infer_hero_cover_theme(preview_trip))
+
+    st.markdown(
+        f"""
+        <nav class="top-nav">
+            <div class="nav-brand"><span class="brand-mark">T</span><span>TripAgent</span></div>
+            <div class="nav-links">
+                <span>AI旅行规划</span>
+                <span>示例</span>
+                <span>反馈</span>
+            </div>
+        </nav>
+        <section class="hero product-hero">
+            <div class="hero-layout">
+                <div>
+                    <div class="eyebrow">AI Private Travel Advisor · Magazine Edition</div>
+                    <h1 class="hero-title"><span class="hero-title-line">一句话生成</span><span class="hero-title-line">你的专属旅行路线</span></h1>
+                    <p>输入目的地、天数和偏好，AI 为你规划每日行程、美食、预算、交通、天气与避坑提醒。</p>
+                    <div class="hero-proof">
+                        <span>多目的地连续规划</span>
+                        <span>天气与出行提醒</span>
+                        <span>Markdown 一键带走</span>
+                    </div>
+                </div>
+                <aside class="hero-panel product-preview">
+                    <div class="preview-cover {cover_theme}">
+                        <div class="preview-cover-art" aria-hidden="true">
+                            <div class="preview-route-arc"></div>
+                            <svg class="preview-illustration" viewBox="0 0 360 190" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M15 155 C70 118 105 130 150 88 C190 50 235 72 345 28" stroke="rgba(253,236,200,0.42)" stroke-width="2" stroke-dasharray="8 9"/>
+                                <path d="M18 162 H344" stroke="rgba(255,247,237,0.20)" stroke-width="2"/>
+                                <path d="M42 162 V103 H78 V162" stroke="rgba(255,247,237,0.36)" stroke-width="2"/>
+                                <path d="M92 162 V74 H132 V162" stroke="rgba(255,247,237,0.32)" stroke-width="2"/>
+                                <path d="M148 162 V116 H184 V162" stroke="rgba(255,247,237,0.34)" stroke-width="2"/>
+                                <path d="M203 162 V62 H251 V162" stroke="rgba(255,247,237,0.28)" stroke-width="2"/>
+                                <path d="M271 162 V96 H318 V162" stroke="rgba(255,247,237,0.34)" stroke-width="2"/>
+                                <path d="M54 118 H66 M104 94 H119 M214 84 H238 M286 113 H305" stroke="rgba(247,213,138,0.45)" stroke-width="2"/>
+                                <circle cx="75" cy="111" r="7" stroke="rgba(247,213,138,0.66)" stroke-width="2"/>
+                                <circle cx="246" cy="64" r="8" stroke="rgba(155,220,255,0.52)" stroke-width="2"/>
+                                <path d="M282 52 L307 39 L332 52" stroke="rgba(253,236,200,0.28)" stroke-width="2"/>
+                                <path d="M295 44 V84 H320 V44" stroke="rgba(253,236,200,0.24)" stroke-width="2"/>
+                            </svg>
+                        </div>
+                        <div class="preview-cover-label">
+                            <span>AI TRAVEL MAGAZINE</span>
+                            <strong>{destination_title}<br>{journey_days_text}</strong>
+                        </div>
+                    </div>
+                </aside>
+            </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_input_box(namespace: str = TRAVEL_INPUT_NAMESPACE) -> tuple[bool, str, str]:
+    """render_input_box：渲染醒目的自然语言输入框。"""
+
+    # text_area_key：输入框使用稳定哈希 key，避免重复渲染时和其他组件冲突。
+    text_area_key = get_travel_textarea_key(namespace)
+
+    # 兼容旧版本 session_state，避免用户刷新后输入内容丢失。
+    if TRAVEL_INPUT_STATE_KEY not in st.session_state and "travel_request_input" in st.session_state:
+        st.session_state[TRAVEL_INPUT_STATE_KEY] = st.session_state.get("travel_request_input", "")
+    if text_area_key not in st.session_state:
+        st.session_state[text_area_key] = st.session_state.get(TRAVEL_INPUT_STATE_KEY, "")
+
+    with st.container(border=True):
+        st.markdown('<p class="input-kicker">Start with one sentence</p>', unsafe_allow_html=True)
+        st.markdown('<p class="input-title">告诉我你想怎么旅行</p>', unsafe_allow_html=True)
+        st.markdown('<p class="sample-title">选择一个示例，或直接输入你的旅行需求</p>', unsafe_allow_html=True)
+
+        # sample_columns：使用 2 列布局，移动端显示更友好（4 列在手机上太挤）。
+        sample_columns = st.columns(2)
+        for index, sample_prompt in enumerate(SAMPLE_PROMPTS):
+            # sample_key：示例按钮唯一 key，包含 namespace、索引、文案和 prompt，避免重复渲染冲突。
+            sample_key = make_widget_key(
+                "sample_prompt_btn",
+                namespace,
+                index,
+                sample_prompt.get("label", ""),
+                sample_prompt.get("prompt", ""),
+            )
+            if sample_columns[index // 2].button(sample_prompt["label"], key=sample_key):
+                st.session_state[TRAVEL_INPUT_STATE_KEY] = sample_prompt["prompt"]
+                st.session_state[text_area_key] = sample_prompt["prompt"]
+
+        # selected_mode_label：用户选择的生成模式，默认快速版以提升感知速度。
+        selected_mode_label = st.radio(
+            "生成模式",
+            options=list(GENERATION_MODE_OPTIONS.keys()),
+            index=0,
+            horizontal=True,
+            key=make_widget_key("generation_mode_radio", namespace),
+            help="快速版更快生成核心攻略；深度版会额外生成旅行清单和拍照打卡内容。",
+        )
+        generation_mode = GENERATION_MODE_OPTIONS.get(selected_mode_label, GENERATION_MODE_FAST)
+
+        with st.form(make_widget_key("travel_request_form", namespace)):
+            # user_input：用户输入的一句话旅行需求。
+            user_input = st.text_area(
+                label="旅行需求",
+                label_visibility="collapsed",
+                placeholder="例如：我想去南京游玩3天，然后再去江西游玩，喜欢历史文化、美食和夜景，预算8000",
+                key=text_area_key,
+            )
+
+            # submitted：用户是否点击了生成按钮。
+            submitted = st.form_submit_button(
+                "生成专属旅行方案",
+                key=make_widget_key("generate_btn", namespace),
+                type="primary",
+                use_container_width=True,
+            )
+
+        st.session_state[TRAVEL_INPUT_STATE_KEY] = user_input
+
+        st.markdown('<p class="hint">不用填复杂表单，一句话就够。没写天数默认 3 天 2 晚；预算数字没写单位时默认人民币 CNY。</p>', unsafe_allow_html=True)
+
+    return submitted, user_input, generation_mode
+
+
+def render_cover(parsed_request: dict, cover_image_url: str) -> None:
+    """render_cover：渲染大封面图区域。"""
+
+    # cover_destination_text：封面专用目的地文本，多目的地用“×”营造旅行杂志标题感。
+    cover_destination_text = " × ".join(parsed_request.get("destinations", [])) or parsed_request["destination"]
+
+    # safe_destination：转义后的目的地文本，避免 HTML 注入。
+    safe_destination = html.escape(cover_destination_text)
+
+    # safe_preferences：转义后的偏好文本。
+    safe_preferences = html.escape("、".join(parsed_request["preferences"]))
+
+    # safe_cover_image_url：转义后的封面图片地址。
+    safe_cover_image_url = html.escape(cover_image_url, quote=True)
+
+    # badge_items：封面上展示的旅行关键信息标签。
+    badge_items = [
+        f"{parsed_request['days']} 天 {parsed_request['nights']} 晚",
+        parsed_request["budget"],
+        *parsed_request["preferences"][:4],
+    ]
+
+    # badge_html：封面标签 HTML。
+    badge_html = "".join(f'<span class="cover-badge">{html.escape(item)}</span>' for item in badge_items)
+
+    st.markdown(
+        f"""
+        <section class="cover-card" style='background-image: url("{safe_cover_image_url}");'>
+            <div class="cover-content">
+                <div class="label">AI TRAVEL MAGAZINE</div>
+                <h2>{safe_destination}</h2>
+                <div class="cover-dayline">{parsed_request["days"]} Days Journey · {html.escape(parsed_request["budget"])}</div>
+                <p>{safe_preferences} · 由 AI 生成的旅行封面与城市探索计划</p>
+                <div class="cover-badges">{badge_html}</div>
+            </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_summary_bento(parsed_request: dict) -> None:
+    """render_summary_bento：用 bento grid 展示攻略摘要信息。"""
+
+    # preferences_text：用于展示的偏好文本。
+    preferences_text = "、".join(parsed_request["preferences"])
+
+    # metric_map：推荐强度、旅行节奏、适合人群和预计总花费。
+    metric_map = build_summary_metrics(parsed_request)
+
+    # budget_note：预算卡片中的说明文本。
+    budget_note = parsed_request.get("budget_exchange_hint") or "价格为区间估算，出发前需再次确认。"
+
+    st.markdown(
+        f"""
+        <h2 class="section-heading">攻略摘要</h2>
+        <p class="section-subtitle">系统从你的自然语言输入中提取旅行关键参数，并补充可执行的规划指标。</p>
+        <div class="bento-grid">
+            <div class="bento-card large warm"><span>目的地</span><strong>{html.escape(parsed_request["destination"])}</strong><p>本次攻略围绕城市动线、主题偏好和轻量避坑提醒展开。</p></div>
+            <div class="bento-card"><span>旅行天数</span><strong>{parsed_request["days"]} 天 {parsed_request["nights"]} 晚</strong><p>按每日四段式节奏规划。</p></div>
+            <div class="bento-card"><span>预算</span><strong>{html.escape(parsed_request["budget"])}</strong><p>{html.escape(budget_note)}</p></div>
+            <div class="bento-card large"><span>偏好标签</span><strong>{html.escape(preferences_text)}</strong><p>用于安排主题街区、美食和拍照点。</p></div>
+            <div class="bento-card"><span>推荐强度</span><strong>{html.escape(metric_map["推荐强度"])}</strong><p>基于偏好匹配度估算。</p></div>
+            <div class="bento-card"><span>旅行节奏</span><strong>{html.escape(metric_map["旅行节奏"])}</strong><p>兼顾体验密度和休息时间。</p></div>
+            <div class="bento-card"><span>适合人群</span><strong>{html.escape(metric_map["适合人群"])}</strong><p>可按同行人群继续微调。</p></div>
+            <div class="bento-card warm"><span>预计总花费</span><strong>{html.escape(metric_map["预计总花费"])}</strong><p>不含跨城机票或长途交通。</p></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_trip_segments_overview(parsed_request: dict) -> None:
+    """render_trip_segments_overview：展示多目的地或推断天数的分段总览。"""
+
+    # trip_segments：系统识别出的目的地分段。
+    trip_segments = parsed_request.get("trip_segments", [])
+    if not trip_segments:
+        return
+
+    # should_show_segments：多目的地或存在默认推断说明时展示分段总览。
+    should_show_segments = parsed_request.get("trip_type") == "multi_destination" or bool(parsed_request.get("trip_notes"))
+    if not should_show_segments:
+        return
+
+    # segment_cards：每个目的地分段的卡片 HTML。
+    segment_cards = []
+    current_day_start = 1
+    for segment in trip_segments:
+        # destination：分段目的地。
+        destination = str(segment.get("destination", "")).strip()
+
+        # segment_days：分段天数。
+        segment_days = int(segment.get("days", DEFAULT_TRAVEL_DAYS))
+
+        # day_range：页面展示的连续 Day 范围。
+        day_range = f"Day {current_day_start}-Day {current_day_start + segment_days - 1}"
+        current_day_start += segment_days
+
+        # inferred_label：未写天数时明确标注默认推断。
+        inferred_label = "默认 " if segment.get("days_inferred") else ""
+
+        # note：分段说明，省份/大区域或默认天数提示。
+        note = str(segment.get("note", "")).strip() or "按用户输入的目的地和偏好生成分段路线。"
+
+        segment_cards.append(
+            '<article class="segment-card">'
+            f'<span>{html.escape(day_range)}</span>'
+            f'<strong>{html.escape(destination)} · {inferred_label}{segment_days} 天 {max(0, segment_days - 1)} 晚</strong>'
+            f'<p>{html.escape(note)}</p>'
+            "</article>"
+        )
+
+    # segment_html：无缩进 HTML，避免 Markdown 把 HTML 识别为代码块。
+    segment_html = (
+        '<h2 class="section-heading">行程分段总览</h2>'
+        '<p class="section-subtitle">多目的地会按连续日期拆分；未说明天数的目的地会明确标注默认规划。</p>'
+        f'<div class="segment-overview-grid">{"".join(segment_cards)}</div>'
+    )
+    st.markdown(segment_html, unsafe_allow_html=True)
+
+
+def render_overview_card(section_map: dict) -> None:
+    """render_overview_card：展示详细攻略的简要说明卡片。"""
+
+    # overview_text：详细旅游攻略内容。
+    overview_text = section_map.get("详细旅游攻略", "")
+    if not overview_text:
+        return
+
+    with st.container(border=True):
+        st.markdown("### 旅行编辑摘要")
+        st.markdown(overview_text)
+
+
+def render_timeline(
+    section_map: dict,
+    parsed_request: dict,
+    travel_json: dict | None = None,
+    json_errors: list[str] | None = None,
+    json_raw: str | None = None,
+) -> None:
+    """render_timeline：用时间线样式展示每日行程。"""
+
+    # timeline_days：优先从结构化 JSON 构建每日行程时间线数据。
+    timeline_days = []
+    timeline_notes = []
+    if travel_json:
+        timeline_days, timeline_notes = build_timeline_days_from_json(travel_json, parsed_request)
+
+    if not timeline_days and json_raw:
+        # raw_travel_json：模型原始 JSON 可能未通过严格校验，但仍可用于普通页面尽量渲染已有行程。
+        raw_travel_json, raw_parse_errors = parse_structured_json_output(json_raw)
+        if raw_travel_json:
+            timeline_days, timeline_notes = build_timeline_days_from_json(raw_travel_json, parsed_request)
+        elif raw_parse_errors:
+            timeline_notes.extend(raw_parse_errors)
+
+    if not timeline_days:
+        markdown_timeline_days, markdown_timeline_notes = build_timeline_days(section_map, parsed_request)
+        if markdown_timeline_days:
+            timeline_days = markdown_timeline_days
+            timeline_notes.extend(markdown_timeline_notes)
+
+    if not timeline_days:
+        st.markdown(
+            """
+            <h2 class="section-heading">每日行程时间线</h2>
+            <p class="section-subtitle">本次行程细节不完整，请尝试重新生成。</p>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.info("本次行程细节不完整，请点击重新生成获取更完整的路线。")
+        if is_debug_enabled():
+            with st.expander("开发者调试信息", expanded=False):
+                for timeline_note in (timeline_notes or json_errors or [])[:8]:
+                    st.markdown(f"- {timeline_note}")
+                if json_raw:
+                    st.code(json_raw, language="json")
+        return
+
+    # day_html_list：每天独立卡片 HTML。
+    day_html_list = []
+    for day in timeline_days:
+        slot_html_list = []
+        for slot in day["slots"]:
+            # original_name/reason/duration/transport/booking_note：结构化 JSON 中的时间段详情。
+            original_name = html.escape(clean_user_facing_text(slot.get("original_name", "")))
+            reason = html.escape(clean_user_facing_text(slot.get("reason", slot.get("description", ""))))
+            duration_text = clean_duration(slot.get("duration", ""))
+            transport = html.escape(clean_user_facing_text(slot.get("transport", "")))
+            booking_note = html.escape(clean_user_facing_text(slot.get("booking_note", "")))
+
+            # duration_meta_html：仅在耗时字段有效时展示，避免出现“耗时 / 小时”。
+            duration_meta_html = (
+                f'<div class="slot-meta-item"><strong>耗时</strong><br>{html.escape(duration_text)}</div>'
+                if duration_text
+                else ""
+            )
+
+            # slot_detail_html：分层展示的时间段信息，避免大段文字堆叠。
+            slot_detail_html = (
+                f'<div class="slot-original">{original_name}</div>'
+                f'<p class="slot-desc">{reason}</p>'
+                '<div class="slot-meta-grid">'
+                f"{duration_meta_html}"
+                f'<div class="slot-meta-item"><strong>交通</strong><br>{transport}</div>'
+                f'<div class="slot-meta-item"><strong>预约/注意</strong><br>{booking_note}</div>'
+                "</div>"
+            )
+            slot_html_list.append(
+                '<div class="timeline-slot">'
+                f'<div class="slot-icon">{html.escape(slot["icon"])}</div>'
+                "<div>"
+                                                f'<div class="slot-time">{html.escape(slot["label"])}&#65372;{html.escape(slot["time"])}</div>'
+                f'<div class="slot-place">{html.escape(clean_user_facing_text(slot["place"]))}</div>'
+                f"{slot_detail_html}"
+                "</div>"
+                "</div>"
+            )
+
+        day_html_list.append(
+            '<article class="timeline-day">'
+            f'<h3>{html.escape(clean_user_facing_text(day["title"]))}</h3>'
+            f'{"".join(slot_html_list)}'
+            "</article>"
+        )
+
+    # timeline_html：无缩进 HTML，避免 Markdown 把 HTML 识别为代码块。
+    timeline_html = (
+        '<h2 class="section-heading">每日行程时间线</h2>'
+        '<p class="section-subtitle">每天拆成上午、中午、下午和晚上四个时间段，便于实际执行。部分信息不足时，请出行前再次确认。</p>'
+        f'<div class="timeline-grid">{"".join(day_html_list)}</div>'
+    )
+
+    st.markdown(timeline_html, unsafe_allow_html=True)
+
+    if timeline_notes and is_debug_enabled():
+        with st.expander("开发者调试信息", expanded=False):
+            for timeline_note in timeline_notes[:8]:
+                st.markdown(f"- {timeline_note}")
+
+
+def render_food_cards(
+    section_map: dict,
+    parsed_request: dict,
+    travel_json: dict | None = None,
+    json_raw: str | None = None,
+) -> None:
+    """render_food_cards：用卡片展示美食推荐。"""
+
+    # food_cards：美食卡片数据。
+    food_cards = build_food_cards_from_json(travel_json, parsed_request) if travel_json else []
+    if not food_cards and json_raw:
+        raw_travel_json, _ = parse_structured_json_output(json_raw)
+        if raw_travel_json:
+            food_cards = build_food_cards_from_json(raw_travel_json, parsed_request)
+    if not food_cards:
+        food_cards = build_food_cards(section_map, parsed_request)
+
+    # food_cards：最终再次按目的地补足，并过滤空卡片。
+    food_cards = ensure_food_cards_per_destination(food_cards, parsed_request)
+
+    if not food_cards:
+        st.markdown(
+            """
+            <h2 class="section-heading">当地美食推荐榜</h2>
+            <div class="weather-fallback">该目的地的具体美食信息不足，请重新生成或开启联网搜索。</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    # grouped_cards：按目的地分组展示。
+    grouped_cards = {}
+    for food in food_cards:
+        destination = food.get("destination") or parsed_request["destination"]
+        grouped_cards.setdefault(destination, []).append(food)
+
+    # group_html_list：每个目的地的美食榜 HTML。
+    group_html_list = []
+    for destination in parsed_request.get("destinations", [parsed_request["destination"]]):
+        destination_cards = grouped_cards.get(destination, [])
+        if not destination_cards:
+            continue
+
+        # food_html：单个目的地下的卡片 HTML。
+        food_html = ""
+        for food in destination_cards[:6]:
+            illustration_class = get_food_illustration_class(food)
+            original_name_html = (
+                f'<div class="food-map-keyword food-original-name">{html.escape(food["name_original"])}</div>'
+                if food.get("name_original") and food.get("name_original") != food.get("title")
+                else ""
+            )
+            food_html += (
+                '<article class="food-card">'
+                f'<div class="food-illustration food-illustration-{html.escape(illustration_class)}" aria-hidden="true">'
+                '<span class="food-illustration-core"></span>'
+                '<span class="food-illustration-steam"></span>'
+                "</div>"
+                f'<h3>{html.escape(food["title"])}</h3>'
+                f"{original_name_html}"
+                f'<div class="food-location">📍 地址：{html.escape(food["location"])}</div>'
+                f'<div class="food-map-keyword">🍜 推荐：{html.escape(food["recommended_dishes"])}</div>'
+                f'<div class="food-map-keyword">💰 人均：{html.escape(food["budget"])}</div>'
+                f'<p>{html.escape(food["reason"])}</p>'
+                f'<div class="food-map-keyword">📌 提醒：{html.escape(food["booking_note"])}</div>'
+                f'<div class="food-map-keyword">地图搜索：{html.escape(food["map_keyword"])}</div>'
+                "</article>"
+            )
+
+        group_html_list.append(
+            f'<h3 class="section-heading">{html.escape(destination)}美食推荐</h3>'
+            f'<div class="food-grid">{food_html}</div>'
+        )
+
+    if not group_html_list:
+        st.markdown(
+            """
+            <h2 class="section-heading">当地美食推荐榜</h2>
+            <div class="weather-fallback">该目的地的具体美食信息不足，请重新生成或开启联网搜索。</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        f"""
+        <h2 class="section-heading">当地美食推荐榜</h2>
+        <p class="section-subtitle">优先列出当地值得专门尝试的店铺、美食街和特色餐饮区域。</p>
+        {"".join(group_html_list)}
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_advice_sections(section_map: dict) -> None:
+    """render_advice_sections：展示交通建议和避坑提醒。"""
+
+    # transport_fallback：交通建议兜底内容。
+    transport_fallback = [
+        "城市内优先使用地铁、公交或官方交通卡，减少频繁打车。",
+        "每天尽量围绕一个区域规划，避免跨城式来回移动。",
+        "机场或车站到酒店先查官方线路，再对比打车价格。",
+        "最后一天优先选择寄存点或酒店寄存，减少拖行李时间。",
+    ]
+
+    # warning_fallback：避坑提醒兜底内容。
+    warning_fallback = [
+        "不要把热门景点、热门餐厅和远距离交通挤在同一天。",
+        "出发前确认营业时间、预约方式和交通路线。",
+        "夜景点受天气影响明显，建议保留备选方案。",
+        "购物和伴手礼尽量放在后半程，避免一路背负行李。",
+    ]
+
+    # transport_cards：交通建议卡片数据。
+    transport_cards = build_advice_cards(section_map.get("交通建议", ""), transport_fallback, max_items=4, default_title="交通提醒")
+    if not transport_cards:
+        transport_cards = build_advice_cards("", transport_fallback, max_items=4, default_title="交通提醒")
+
+    # warning_cards：避坑提醒卡片数据。
+    warning_cards = build_advice_cards(section_map.get("避坑提醒", ""), warning_fallback, max_items=4, default_title="避坑提醒")
+    if not warning_cards:
+        warning_cards = build_advice_cards("", warning_fallback, max_items=4, default_title="避坑提醒")
+
+    # budget_items：预算估算列表，过滤 Markdown 表头、分隔线和空项目。
+    budget_items = build_budget_items(section_map.get("预算估算", ""), max_items=6)
+
+    def render_advice_card_html(card: dict, article_classes: str, icon_class: str, icon_text: str) -> str:
+        """render_advice_card_html：渲染交通/避坑卡片，标题不截断，正文为空时不输出空段落。"""
+
+        # card_title/card_description：卡片标题和正文，均完整保留。
+        card_title = clean_user_facing_text(card.get("title", ""))
+        card_description = clean_user_facing_text(card.get("description", ""))
+        description_html = (
+            f'<p class="card-body">{html.escape(card_description)}</p>'
+            if is_meaningful_text(card_description)
+            else ""
+        )
+        return f"""
+        <article class="{article_classes}">
+            <div class="card-title-row">
+                <div class="{icon_class} card-icon advice-icon">{html.escape(icon_text)}</div>
+                <div class="card-title-wrap card-content">
+                    <h3 class="card-title">{html.escape(card_title)}</h3>
+                </div>
+            </div>
+            {description_html}
+        </article>
+        """
+
+    transport_html = "".join(
+        render_advice_card_html(
+            card,
+            "info-card advice-card transport-card glass-card section-card",
+            "info-icon",
+            "i",
+        )
+        for card in transport_cards
+    )
+
+    warning_html = "".join(
+        render_advice_card_html(
+            card,
+            "warning-card advice-card tip-card glass-card section-card",
+            "warning-icon",
+            "!",
+        )
+        for card in warning_cards
+    )
+
+    st.markdown(
+        f"""
+        <h2 class="section-heading">交通建议</h2>
+        <p class="section-subtitle">优先减少无效移动，把时间留给真正的体验。</p>
+        <div class="info-grid">{transport_html}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if budget_items:
+        # budget_html：预算估算卡片 HTML。
+        budget_html = "".join(
+            '<article class="budget-card">'
+            f'<span>{html.escape(budget_item["title"])}</span>'
+            f'<p class="budget-amount">{html.escape(budget_item["description"])}</p>'
+            "</article>"
+            for budget_item in budget_items
+        )
+        # budget_section_html：无缩进 HTML，避免 Markdown 把卡片识别为代码块。
+        budget_section_html = (
+            '<h2 class="section-heading">预算估算</h2>'
+            '<p class="section-subtitle">把花费拆成交通、住宿、餐饮和机动预算，方便你出发前调整。</p>'
+            f'<div class="budget-grid">{budget_html}</div>'
+        )
+        st.markdown(budget_section_html, unsafe_allow_html=True)
+
+    st.markdown(
+        f"""
+        <h2 class="section-heading">避坑提醒</h2>
+        <p class="section-subtitle">提前规避高概率踩坑点，让行程更稳定。</p>
+        <div class="warning-grid">{warning_html}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def get_display_travel_json(travel_json: dict | None, json_raw: str | None = None) -> dict | None:
+    """get_display_travel_json：获取可用于页面渲染的结构化 JSON。"""
+
+    if isinstance(travel_json, dict):
+        return travel_json
+    if json_raw:
+        # raw_travel_json：模型原始 JSON，可能未通过严格校验，但可用于非关键模块渲染。
+        raw_travel_json, _ = parse_structured_json_output(json_raw)
+        if isinstance(raw_travel_json, dict):
+            return raw_travel_json
+    return None
+
+
+def render_packing_checklist(
+    parsed_request: dict,
+    travel_json: dict | None,
+    json_raw: str | None,
+    weather_cards: list[dict] | None,
+) -> None:
+    """render_packing_checklist：渲染旅行准备清单模块。"""
+
+    # display_json：用于读取模型 packing_checklist 的 JSON。
+    display_json = get_display_travel_json(travel_json, json_raw)
+
+    # packing_checklist：最终清单数据。
+    packing_checklist = build_packing_checklist(parsed_request, weather_cards, display_json)
+
+    # group_labels：清单字段和页面标题。
+    group_labels = {
+        "documents": "证件与通行",
+        "payment_and_network": "支付与通信",
+        "weather_and_clothing": "天气与穿搭",
+        "electronics": "电子设备",
+        "medicine_and_emergency": "药品与应急",
+        "photo_preparation": "拍照与出片准备",
+        "pre_departure_checks": "出发前确认事项",
+    }
+
+    # card_html_list：所有清单分组卡片 HTML。
+    card_html_list = []
+    for group_key, group_label in group_labels.items():
+        items = packing_checklist.get(group_key, [])
+        if not items:
+            continue
+        item_html = "".join(f"<li>{html.escape(item)}</li>" for item in items[:8])
+        card_html_list.append(
+            '<article class="checklist-card">'
+            f"<h3>{html.escape(group_label)}</h3>"
+            f'<ul class="checklist-list">{item_html}</ul>'
+            "</article>"
+        )
+
+    if not card_html_list:
+        return
+
+    st.markdown(
+        (
+            '<h2 class="section-heading">旅行准备清单 🧳</h2>'
+            '<p class="section-subtitle">根据目的地、天气、偏好和跨境情况整理，出发前逐项核对。</p>'
+            f'<div class="checklist-grid">{"".join(card_html_list)}</div>'
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_photo_spots(parsed_request: dict, travel_json: dict | None, json_raw: str | None) -> None:
+    """render_photo_spots：渲染拍照打卡推荐模块。"""
+
+    # display_json/photo_spots：用于页面展示的拍照点。
+    display_json = get_display_travel_json(travel_json, json_raw)
+    photo_spots = build_photo_spots(parsed_request, display_json)
+    if not photo_spots:
+        return
+
+    # grouped_spots：按目的地分组。
+    grouped_spots = {}
+    for spot in photo_spots:
+        destination = spot.get("destination") or parsed_request["destination"]
+        grouped_spots.setdefault(destination, []).append(spot)
+
+    # group_html_list：所有目的地拍照打卡区域。
+    group_html_list = []
+    for destination in parsed_request.get("destinations") or [parsed_request["destination"]]:
+        destination_spots = grouped_spots.get(destination, [])
+        if not destination_spots:
+            continue
+
+        spot_html = ""
+        for spot in destination_spots[:6]:
+            spot_html += (
+                '<article class="photo-card">'
+                f"<h3>{html.escape(spot['name'])}</h3>"
+                '<div class="photo-meta">'
+                f"<span><strong>📍 位置</strong><br>{html.escape(spot['location'])}</span>"
+                f"<span><strong>📷 适合</strong><br>{html.escape(spot['best_for'])}</span>"
+                f"<span><strong>⏰ 最佳时间</strong><br>{html.escape(spot['best_time'])}</span>"
+                "</div>"
+                f"<p>💡 {html.escape(spot['photo_tip'])}</p>"
+                f"<p>📌 {html.escape(spot['reminder'])}</p>"
+                "</article>"
+            )
+
+        group_html_list.append(
+            f'<h3 class="section-heading">{html.escape(destination)}拍照打卡</h3>'
+            f'<div class="photo-grid">{spot_html}</div>'
+        )
+
+    if not group_html_list:
+        return
+
+    st.markdown(
+        (
+            '<h2 class="section-heading">拍照打卡推荐 📸</h2>'
+            '<p class="section-subtitle">按目的地整理具体机位、最佳时间和拍摄建议，适合朋友圈、小红书和旅行纪念照。</p>'
+            f'{"".join(group_html_list)}'
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_source_info(section_map: dict, generated_at: str | None = None) -> None:
+    """render_source_info：展示信息来源与更新时间区域。"""
+
+    # source_text：模型生成的来源与更新时间内容，普通用户界面不直接展示技术状态。
+    source_text = section_map.get("信息来源与更新时间", "")
+
+    with st.container(border=True):
+        st.markdown('<div class="source-card-title">信息与更新时间</div>', unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <p class="source-card-text">本攻略由 AI 根据你的输入和当前可用信息整理生成。</p>
+            <p class="source-card-text">更新时间：{html.escape(generated_at or datetime.now().strftime('%Y-%m-%d %H:%M'))}</p>
+            <p class="source-card-text">门票、预约、开放时间、交通政策和天气情况可能变化，请出行前以官方渠道和天气 App 为准。</p>
+            """,
+            unsafe_allow_html=True,
+        )
+        if source_text and is_debug_enabled():
+            with st.expander("开发者调试信息", expanded=False):
+                st.markdown(source_text)
+
+
+def render_weather_section(weather_cards: list[dict] | None) -> None:
+    """render_weather_section：渲染天气与出行提醒卡片。"""
+
+    st.markdown('<h2 class="section-heading">天气与出行提醒 🌦️</h2>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="section-subtitle">根据最近几天的天气情况整理携带建议，出发前请再用天气 App 复核一次。</p>',
+        unsafe_allow_html=True,
+    )
+
+    if not weather_cards:
+        st.markdown(
+            '<div class="weather-fallback">天气信息暂时无法获取，请出行前查看天气 App。</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # weather_card_html_list：所有目的地天气卡片 HTML。
+    weather_card_html_list = []
+    for weather_card in weather_cards:
+        # destination：天气卡片展示的目的地。
+        destination = html.escape(str(weather_card.get("destination", "目的地")))
+
+        if weather_card.get("error"):
+            weather_card_html_list.append(
+                '<article class="weather-card">'
+                f'<h3>{destination}｜未来 {WEATHER_FORECAST_DAYS} 天天气</h3>'
+                f'<p class="weather-advice">{html.escape(str(weather_card["error"]))}</p>'
+                "</article>"
+            )
+            continue
+
+        # day_html_list：单个目的地内的每日天气 HTML。
+        day_html_list = []
+        for day_weather in weather_card.get("days", []):
+            # will_rain_text：是否可能下雨的展示文本。
+            will_rain_text = "可能下雨" if day_weather.get("will_rain") else "降雨风险较低"
+
+            day_html_list.append(
+                '<div class="weather-day">'
+                f'<div class="weather-icon">{html.escape(str(day_weather.get("weather_icon", "🌦️")))}</div>'
+                "<div>"
+                f'<div class="weather-date">{html.escape(str(day_weather.get("date", "")))}</div>'
+                f'<div class="weather-main">天气：{html.escape(str(day_weather.get("weather_text", "天气待确认")))}</div>'
+                '<div class="weather-meta">'
+                f'<span>温度：{html.escape(format_weather_value(day_weather.get("temperature_min"), "°C"))} - {html.escape(format_weather_value(day_weather.get("temperature_max"), "°C"))}</span>'
+                f'<span>湿度：{html.escape(format_weather_value(day_weather.get("humidity"), "%"))}</span>'
+                f'<span>降水概率：{html.escape(format_weather_value(day_weather.get("precipitation_probability"), "%"))}</span>'
+                f'<span>{html.escape(will_rain_text)}</span>'
+                "</div>"
+                f'<p class="weather-advice">建议：{html.escape(str(day_weather.get("advice", "天气信息仅供参考，请出行前查看天气 App。")))}</p>'
+                "</div>"
+                "</div>"
+            )
+
+        weather_card_html_list.append(
+            '<article class="weather-card">'
+            f'<h3>{destination}｜未来 {WEATHER_FORECAST_DAYS} 天天气</h3>'
+            f'{"".join(day_html_list)}'
+            "</article>"
+        )
+
+    # weather_html：无缩进 HTML，避免 Markdown 把天气卡片识别为代码块。
+    weather_html = f'<div class="weather-grid">{"".join(weather_card_html_list)}</div>'
+    st.markdown(weather_html, unsafe_allow_html=True)
+
+
+def render_travel_blessing() -> None:
+    """render_travel_blessing：在攻略最后展示温和的旅行祝福语。"""
+
+    st.markdown(
+        """
+        <div class="blessing-card">
+            祝你这次旅行顺利又开心。记得提前确认天气、门票和交通安排，慢慢走、好好看，把喜欢的风景都装进记忆里。祝你旅途愉快呀～ 🌿✨🧳
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_visual_guide(
+    markdown_text: str,
+    parsed_request: dict,
+    travel_json: dict | None = None,
+    json_errors: list[str] | None = None,
+    json_raw: str | None = None,
+    weather_cards: list[dict] | None = None,
+    generated_at: str | None = None,
+    include_deep_modules: bool = True,
+) -> None:
+    """render_visual_guide：把 Markdown 攻略渲染成高级卡片式视觉结果。"""
+
+    # section_map：按标题拆分后的攻略内容。
+    section_map = split_markdown_sections(markdown_text)
+
+    if not section_map:
+        with st.container(border=True):
+            st.markdown(markdown_text)
+        render_timeline({}, parsed_request, travel_json, json_errors, json_raw)
+        if include_deep_modules:
+            render_packing_checklist(parsed_request, travel_json, json_raw, weather_cards)
+            render_photo_spots(parsed_request, travel_json, json_raw)
+        render_weather_section(weather_cards)
+        render_source_info({}, generated_at)
+        render_travel_blessing()
+        return
+
+    render_overview_card(section_map)
+    render_timeline(section_map, parsed_request, travel_json, json_errors, json_raw)
+    render_food_cards(section_map, parsed_request, travel_json, json_raw)
+    render_advice_sections(section_map)
+    if include_deep_modules:
+        render_packing_checklist(parsed_request, travel_json, json_raw, weather_cards)
+        render_photo_spots(parsed_request, travel_json, json_raw)
+    render_weather_section(weather_cards)
+    render_source_info(section_map, generated_at)
+    render_travel_blessing()
+
+
+def render_copy_button(markdown_text: str, namespace: str = "copy_markdown") -> None:
+    """render_copy_button：渲染可复制 Markdown 攻略的按钮。"""
+
+    # markdown_json：安全注入到 JavaScript 的攻略文本。
+    markdown_json = json.dumps(markdown_text, ensure_ascii=False)
+    markdown_digest = hashlib.md5(markdown_text.encode("utf-8")).hexdigest()[:12]
+    copy_widget_id = make_widget_key("copy_widget", namespace, markdown_digest)
+    copy_button_id = f"{copy_widget_id}_button"
+    copy_status_id = f"{copy_widget_id}_status"
+
+    st.html(
+        f"""
+        <style>
+        .copy-widget {{
+            font-family: Arial, sans-serif;
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+            padding: 8px 0;
+            width: 100%;
+        }}
+        .copy-widget button {{
+            border: 1px solid rgba(246, 199, 111, 0.32);
+            border-radius: 999px;
+            padding: 12px 18px;
+            background: linear-gradient(135deg, #f6c76f, #fb923c);
+            color: #17120a;
+            font-weight: 800;
+            cursor: pointer;
+            box-shadow: 0 12px 28px rgba(251, 146, 60, 0.18);
+            width: 100%;
+        }}
+        .copy-widget span {{
+            color: #cbd5e1;
+            font-size: 14px;
+        }}
+        </style>
+        <div class="copy-widget">
+            <button id="{copy_button_id}">复制攻略</button>
+            <span id="{copy_status_id}">一键复制 Markdown 全文。</span>
+        </div>
+        <script>
+        const markdownText = {markdown_json};
+        const copyButton = document.getElementById("{copy_button_id}");
+        const copyStatus = document.getElementById("{copy_status_id}");
+        copyButton.addEventListener("click", async () => {{
+            try {{
+                await navigator.clipboard.writeText(markdownText);
+                copyStatus.textContent = "已复制到剪贴板。";
+            }} catch (error) {{
+                copyStatus.textContent = "复制失败，请手动复制下方原文。";
+            }}
+        }});
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
+
+
+def render_result_actions(markdown_text: str, namespace: str = "result_actions") -> None:
+    """render_result_actions：在结果底部展示复制、下载和重新生成操作。"""
+
+    # markdown_digest：结果操作按钮 key 使用的内容摘要。
+    markdown_digest = hashlib.md5(markdown_text.encode("utf-8")).hexdigest()[:12]
+
+    with st.container(border=True):
+        st.markdown('<div class="result-actions-title">结果操作</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<p class="source-card-text">复制给同行人、下载成 Markdown，或基于当前输入重新生成一版。</p>',
+            unsafe_allow_html=True,
+        )
+
+        # action_columns：结果操作按钮区域。
+        action_columns = st.columns([1.2, 0.8, 0.8])
+        with action_columns[0]:
+            render_copy_button(markdown_text, namespace=f"{namespace}_copy")
+        with action_columns[1]:
+            st.download_button(
+                label="下载 Markdown",
+                data=markdown_text,
+                file_name="ai-travel-guide.md",
+                mime="text/markdown",
+                key=make_widget_key("download_markdown", namespace, markdown_digest),
+            )
+        with action_columns[2]:
+            if st.button("重新生成", key=make_widget_key("regenerate_btn", namespace, markdown_digest)):
+                st.session_state["force_regenerate"] = True
+                st.rerun()
+
+
+def render_markdown_source(markdown_text: str, namespace: str = "markdown_source") -> None:
+    """render_markdown_source：用折叠区域展示 Markdown 原文，并提供复制和下载。"""
+
+    # markdown_digest：Markdown 原文区域下载按钮的唯一内容摘要。
+    markdown_digest = hashlib.md5(markdown_text.encode("utf-8")).hexdigest()[:12]
+
+    st.markdown('<h2 class="section-heading">Markdown 原文</h2>', unsafe_allow_html=True)
+    st.markdown('<p class="section-subtitle">默认收起，适合最后复制到笔记、公众号或行程文档中。</p>', unsafe_allow_html=True)
+
+    with st.expander("查看可复制的 Markdown 攻略", expanded=False):
+        # action_columns：复制和下载按钮区域。
+        action_columns = st.columns([1, 1])
+        with action_columns[0]:
+            render_copy_button(markdown_text, namespace=f"{namespace}_copy")
+        with action_columns[1]:
+            st.download_button(
+                label="下载 Markdown 文件",
+                data=markdown_text,
+                file_name="ai-travel-guide.md",
+                mime="text/markdown",
+                key=make_widget_key("download_markdown", namespace, markdown_digest),
+            )
+
+        st.code(markdown_text, language="markdown")
+
+
+def render_debug_panel(parsed_request: dict) -> None:
+    """render_debug_panel：默认折叠展示系统识别出的结构化参数。"""
+
+    if not is_debug_enabled():
+        return
+
+    # debug_data：开发调试用的结构化解析结果。
+    debug_data = {
+        "trip_type": parsed_request.get("trip_type"),
+        "destination": parsed_request["destination"],
+        "destinations": parsed_request.get("destinations", []),
+        "trip_segments": parsed_request.get("trip_segments", []),
+        "trip_notes": parsed_request.get("trip_notes", []),
+        "days": parsed_request["days"],
+        "nights": parsed_request["nights"],
+        "budget_amount": parsed_request.get("budget_amount"),
+        "currency": parsed_request.get("budget_currency") or "未指定",
+        "style": parsed_request.get("style") or parsed_request.get("budget_level"),
+        "preferences": "、".join(parsed_request["preferences"]),
+    }
+
+    with st.expander("开发者调试信息", expanded=False):
+        st.json(debug_data)
+
+
+def format_public_search_status(search_message: str | None) -> str:
+    """format_public_search_status：把内部搜索状态转换为普通用户可理解的提示。"""
+
+    if not search_message:
+        return "实时信息未启用，请出行前二次确认。"
+
+    # raw_message：内部搜索状态文案。
+    raw_message = str(search_message)
+    if "已启用" in raw_message:
+        return "已参考当前可用公开信息。"
+    if "缓存" in raw_message:
+        return "已参考近期可用信息。"
+    if "未启用" in raw_message or "未配置" in raw_message:
+        return "实时信息未启用，请出行前二次确认。"
+    if "额度" in raw_message or "失败" in raw_message or "受限" in raw_message:
+        return "实时信息暂时不可用，请出行前二次确认。"
+
+    return "请出行前再次确认门票、预约、开放时间和交通政策。"
+
+
+def render_search_status(search_message: str | None) -> None:
+    """render_search_status：用小标签展示 Tavily 联网搜索状态。"""
+
+    # safe_message：转义后的状态文案，避免 HTML 注入。
+    safe_message = html.escape(format_public_search_status(search_message))
+    st.markdown(
+        f"""
+        <div class="search-status-pill">
+            <span class="search-status-dot"></span>
+            <span>{safe_message}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_trust_strip(search_message: str | None, generated_at: str | None) -> None:
+    """render_trust_strip：展示轻量信任说明，提醒用户核对实时信息。"""
+
+    # search_status_text：联网搜索状态文案。
+    search_status_text = format_public_search_status(search_message)
+
+    # generated_time_text：攻略生成时间。
+    generated_time_text = generated_at or datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    st.markdown(
+        f"""
+        <div class="trust-strip">
+            <article class="trust-card">
+                <span>信息提示</span>
+                <strong>{html.escape(search_status_text)}</strong>
+                <p>如未联网，实时门票、预约和开放时间请出行前再次核对。</p>
+            </article>
+            <article class="trust-card">
+                <span>AI Generated</span>
+                <strong>攻略由 AI 生成，仅供参考</strong>
+                <p>路线、预算和餐饮建议适合作为初步规划，不替代官方信息。</p>
+            </article>
+            <article class="trust-card">
+                <span>Updated</span>
+                <strong>{html.escape(generated_time_text)}</strong>
+                <p>门票、预约、开放时间和交通政策请以官方渠道为准。</p>
+            </article>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def get_generation_count() -> int:
+    """get_generation_count：读取当前浏览器 session 已生成攻略次数。"""
+
+    return int(st.session_state.get("generation_count", 0))
+
+
+def render_generation_quota() -> None:
+    """render_generation_quota：展示 Beta 测试版当前 session 剩余生成次数。"""
+
+    # remaining_count：当前 session 剩余生成次数。
+    remaining_count = max(0, MAX_GENERATIONS_PER_SESSION - get_generation_count())
+    st.markdown(
+        f"""
+        <p class="generation-quota">Beta 测试额度：本会话剩余 {remaining_count}/{MAX_GENERATIONS_PER_SESSION} 次生成。</p>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def build_result_data(user_input: str, generation_mode: str = GENERATION_MODE_FAST) -> dict:
+    """build_result_data：根据用户输入生成结果数据，但不把完整用户输入保存到 session。"""
+
+    # timing_log：仅用于 SHOW_DEBUG=true 时查看各阶段耗时，不包含用户密钥。
+    timing_log: dict[str, float | str] = {"generation_mode": generation_mode}
+
+    # total_start_time：本次生成总耗时起点。
+    total_start_time = time.perf_counter()
+
+    # generated_at：本次攻略生成时间。
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # parsed_request：自然语言解析结果。
+    parse_start_time = time.perf_counter()
+    parsed_request = parse_travel_request(user_input)
+    parsed_request["generation_mode"] = generation_mode
+    parsed_request["generation_mode_label"] = get_generation_mode_label(generation_mode)
+    timing_log["parse_input_time"] = round(time.perf_counter() - parse_start_time, 3)
+
+    # cover_image_url：封面图地址，第一版是本地 SVG 占位。
+    cover_image_url = generate_cover_image_url(parsed_request)
+
+    with st.status("正在理解你的旅行需求...", expanded=True) as loading_status:
+        if get_bool_config("USE_TAVILY", True) and get_tavily_api_key():
+            loading_status.update(label="正在检索目的地最新信息...", state="running")
+        else:
+            loading_status.update(label="当前未启用联网搜索，正在切换普通生成模式...", state="running")
+
+        # facts_context：联网搜索整理出的事实校验上下文。
+        tavily_start_time = time.perf_counter()
+        facts_context, source_records, search_message = build_facts_context(parsed_request)
+        timing_log["tavily_search_time"] = round(time.perf_counter() - tavily_start_time, 3)
+
+        loading_status.update(label="正在规划每日路线...", state="running")
+        # markdown_text/travel_json：最终展示的 Markdown 和页面时间线使用的结构化 JSON。
+        deepseek_start_time = time.perf_counter()
+        markdown_text, api_message, travel_json, json_raw, json_errors = generate_travel_content(
+            user_input,
+            parsed_request,
+            facts_context,
+            generation_mode,
+        )
+        timing_log["deepseek_time"] = round(time.perf_counter() - deepseek_start_time, 3)
+
+        loading_status.update(label="正在整理美食与天气提醒...", state="running")
+        # weather_cards：Open-Meteo 免费天气数据，失败不影响攻略生成。
+        weather_start_time = time.perf_counter()
+        try:
+            weather_cards = build_weather_cards(parsed_request, travel_json)
+        except Exception:
+            weather_cards = []
+        timing_log["weather_time"] = round(time.perf_counter() - weather_start_time, 3)
+
+        markdown_text = append_weather_and_blessing_to_markdown(
+            markdown_text,
+            weather_cards,
+            generated_at,
+            parsed_request,
+            travel_json,
+            include_deep_modules=generation_mode == GENERATION_MODE_DEEP,
+        )
+        loading_status.update(label="正在生成专属旅行方案...", state="running")
+        loading_status.update(label="专属旅行方案已生成", state="complete", expanded=False)
+
+    timing_log["total_generation_time"] = round(time.perf_counter() - total_start_time, 3)
+
+    return {
+        "parsed_request": parsed_request,
+        "cover_image_url": cover_image_url,
+        "markdown_text": markdown_text,
+        "api_message": api_message,
+        "travel_json": travel_json,
+        "json_raw": json_raw,
+        "json_errors": json_errors,
+        "weather_cards": weather_cards,
+        "search_message": search_message,
+        "generated_at": generated_at,
+        "generation_mode": generation_mode,
+        "timing_log": timing_log,
+    }
+
+
+def render_result_data(result_data: dict) -> None:
+    """render_result_data：渲染已经生成并缓存在当前 session 中的攻略结果。"""
+
+    # render_start_time：结果渲染耗时起点，仅用于调试。
+    render_start_time = time.perf_counter()
+
+    # parsed_request：结构化旅行参数，不包含任何 API Key。
+    parsed_request = result_data["parsed_request"]
+
+    # markdown_text：最终展示和复制的 Markdown 攻略。
+    markdown_text = result_data["markdown_text"]
+
+    render_search_status(result_data.get("search_message"))
+    render_trust_strip(result_data.get("search_message"), result_data.get("generated_at"))
+
+    if result_data.get("api_message") and is_debug_enabled():
+        with st.expander("开发者调试信息", expanded=False):
+            st.markdown(html.escape(str(result_data["api_message"])))
+
+    render_debug_panel(parsed_request)
+    render_cover(parsed_request, result_data["cover_image_url"])
+    render_summary_bento(parsed_request)
+    render_trip_segments_overview(parsed_request)
+    render_visual_guide(
+        markdown_text,
+        parsed_request,
+        result_data.get("travel_json"),
+        result_data.get("json_errors"),
+        result_data.get("json_raw"),
+        result_data.get("weather_cards"),
+        result_data.get("generated_at"),
+        include_deep_modules=result_data.get("generation_mode", GENERATION_MODE_FAST) == GENERATION_MODE_DEEP,
+    )
+    render_result_actions(markdown_text)
+    render_markdown_source(markdown_text)
+
+    # timing_log：只在调试模式下展示性能耗时，不包含 API Key 或 Secrets。
+    timing_log = dict(result_data.get("timing_log") or {})
+    timing_log["render_time"] = round(time.perf_counter() - render_start_time, 3)
+    result_data["timing_log"] = timing_log
+    if is_debug_enabled():
+        with st.expander("开发者调试信息", expanded=False):
+            st.json(timing_log)
+
+
+def render_beta_notice() -> None:
+    """render_beta_notice：在页面底部展示 Beta 测试版和隐私安全提醒。"""
+
+    st.markdown(
+        f"""
+        <div class="beta-notice">{html.escape(BETA_NOTICE_TEXT)}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def main() -> None:
     """main：应用入口函数。"""
 
     setup_page()
